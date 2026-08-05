@@ -1,14 +1,34 @@
-import {routeCommand} from "./assistant/command-router.js";
+import {createInterface} from "node:readline/promises";
+import {stdin, stdout} from "node:process";
+import {routeCommand} from "./assistant/command-router.ts";
 
-const commands = [
-    "Que horas são?",
-    "Me diga as horas",
-    "Me diga a hora",
-    "Faça um café",
-];
+const terminal = createInterface({
+    input: stdin,
+    output: stdout,
+});
 
-for (const command of commands) {
-    const result = routeCommand(command);
-    console.log(`Comando: ${command}`);
-    console.log(`Resultado: ${result.message}`);
+async function main(): Promise<void> {
+    console.log("Ultron iniciado")
+    console.log("Digite um comando ou 'sair' para encerrar o programa");
+
+    try {
+    while (true) {
+        const command = await terminal.question("\nMe> ");
+
+        if (command.trim().toLowerCase() === "sair") {
+            console.log("Encerrando o programa...");
+            break;
+        }
+
+        const result = await routeCommand(command);
+        console.log(`Ultron> ${result.message}`);
+    }
+}finally {
+    terminal.close();
+    }
 }
+
+main().catch((error: unknown) => {
+    console.error("FATAL ERROR:", error);
+    process.exitCode = 1;
+});

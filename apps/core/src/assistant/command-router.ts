@@ -5,7 +5,7 @@ function normalizeCommand(command: string): string {
     return command.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
 }
 
-export function routeCommand(command: string): ToolResult {
+export async function routeCommand(command: string): Promise<ToolResult> {
     const normalizedCommand = normalizeCommand(command);
 
     if (!normalizedCommand) {
