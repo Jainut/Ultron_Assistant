@@ -7,7 +7,7 @@ export function getTime(): ToolResult<{ hour: number; minute: number }> {
 
     return {
         success: true,
-        message: `Agora são ${hour} horas e ${minute} minutos.`,
+        message: `Agora são ${hour} e ${minute}`,
         data: { hour, minute },
     }
 }

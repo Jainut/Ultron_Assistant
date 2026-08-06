@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx src/index.ts",
+    "test:tts": "tsx src/dev/test-tts.ts",
     "build": "tsc",
     "start": "node dist/index.js"
   },

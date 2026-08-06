@@ -1,6 +1,7 @@
 import {createInterface} from "node:readline/promises";
 import {stdin, stdout} from "node:process";
 import {routeCommand} from "./assistant/command-router.ts";
+import { speak } from "./speech/speak.ts";
 
 const terminal = createInterface({
     input: stdin,
@@ -22,6 +23,12 @@ async function main(): Promise<void> {
 
         const result = await routeCommand(command);
         console.log(`Ultron> ${result.message}`);
+
+        try {
+            await speak(result.speech ?? result.message);
+        } catch (error) {
+            console.error("Erro no sistema de voz:", error);
+        }
     }
 }finally {
     terminal.close();
