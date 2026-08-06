@@ -27,17 +27,15 @@ def apply_effects(audio: np.ndarray) -> np.ndarray:
 
 def save_audio(audio_array: np.ndarray, output_file: Path) -> None:
     sf.write(output_file, audio_array, samplerate=SAMPLE_RATE)
-    print(f"Áudio gerado com sucesso em: {output_file}")
 
 def generate_audio(text: str, output_file: Path) -> Path:
-    print("Gerando áudio...")
+    started_at = perf_counter()
+
     generator = pipeline(text, voice="pm_alex", speed=0.85)
 
     generated_chunks: list[np.ndarray] = []
 
     for index, (_, phonemes, audio) in enumerate(generator):
-        print(f"Trecho gerado: {index}...")
-
         audio_array = (
             audio.cpu().numpy() 
             if hasattr(audio, "cpu")
@@ -54,4 +52,7 @@ def generate_audio(text: str, output_file: Path) -> Path:
 
     output_file.parent.mkdir(parents=True, exist_ok=True)
     save_audio(processed_audio, output_file)
+
+    print(f"Geração total: {perf_counter() - started_at:.2f}s", flush=True)
+
     return output_file
