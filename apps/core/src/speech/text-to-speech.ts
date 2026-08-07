@@ -75,6 +75,9 @@ export class TextToSpeechService {
                         PYTHONIOENCODING: "utf-8",
                         PYTHONUTF8: "1",
                         PYTHONUNBUFFERED: "1",
+
+                        HF_HUB_VERBOSITY: "error",
+                        PYTHONWARNINGS: "ignore::UserWarning,ignore::FutureWarning",
                     },
                 },
             );

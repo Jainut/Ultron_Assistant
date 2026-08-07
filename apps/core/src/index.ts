@@ -1,65 +1,103 @@
-import { createInterface } from "node:readline/promises";
-import { stdin, stdout } from "node:process";
+import { unlink } from "node:fs/promises";
 
 import { routeCommand } from "./assistant/command-router.ts";
-import { playAudio } from "./speech/audio_player.ts";
-import { TextToSpeechService } from "./speech/text-to-speech.ts";
 
-const terminal = createInterface({
-    input: stdin,
-    output: stdout,
-});
+import { TextToSpeechService } from "./speech/text-to-speech.ts";
+import { SpeechToTextService } from "./speech/speech-to-text.ts";
+import { playAudio } from "./speech/audio_player.ts";
+
 
 const tts = new TextToSpeechService();
+const stt = new SpeechToTextService();
+
 
 async function main(): Promise<void> {
+    console.log("Inicializando Ultron...\n");
+
     try {
         console.log("Carregando sistema de voz...");
-
         await tts.start();
 
-        console.log("Ultron iniciado");
-        console.log("Digite um comando ou 'sair' para encerrar o programa");
+        console.log("Carregando reconhecimento de voz...");
+        await stt.start();
+
+        console.log("\nUltron iniciado.");
+        console.log('Diga "Ultron" para chamar o assistente.');
 
         while (true) {
-            const command = await terminal.question("\nMe> ");
+            let command: string;
 
-            if (command.trim().toLowerCase() === "sair") {
-                console.log("Encerrando o programa...");
-                break;
-            }
+            try {
+                command = await stt.listen();
+            } catch (error) {
+                console.error(
+                    "Erro ao escutar:",
+                    error,
+                );
 
-            const result = await routeCommand(command);
-
-            console.log(`Ultron> ${result.message}`);
-
-            if (result.shouldSpeak === false) {
                 continue;
             }
 
+            console.log(`\nVocê> ${command}`);
+
+            const normalizedCommand = command
+                .trim()
+                .toLowerCase();
+
+            if (normalizedCommand === "sair") {
+                console.log(
+                    "Encerrando o programa...",
+                );
+
+                break;
+            }
+
             try {
+                const result = await routeCommand(
+                    command,
+                );
+
+                console.log(
+                    `Ultron> ${result.message}`,
+                );
+
                 const speechText =
                     result.speech ?? result.message;
 
-                const audioPath = await tts.synthesize(
-                    speechText,
-                );
+                let audioPath: string | null = null;
 
-                await playAudio(audioPath);
-            } catch (error: unknown) {
+                try {
+                    audioPath = await tts.synthesize(
+                        speechText,
+                    );
+
+                    await playAudio(audioPath);
+                } finally {
+                    if (audioPath) {
+                        await unlink(
+                            audioPath,
+                        ).catch(() => { });
+                    }
+                }
+            } catch (error) {
                 console.error(
-                    "Erro no sistema de voz:",
+                    "Erro ao processar comando:",
                     error,
                 );
             }
         }
     } finally {
+        stt.stop();
         tts.stop();
-        terminal.close();
     }
 }
 
+
 main().catch((error: unknown) => {
-    console.error("FATAL ERROR:", error);
+    console.error(
+        "FATAL ERROR:",
+        error,
+    );
+
     process.exitCode = 1;
 });
