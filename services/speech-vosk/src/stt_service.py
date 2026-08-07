@@ -35,6 +35,16 @@ WAKE_EXPRESSIONS = [
     "ultra",
 ]
 
+def debug_log(message: str) -> None:
+    if DEBUG:
+        print(
+            message,
+            file=sys.stderr,
+            flush=True,
+        )
+
+DEBUG = False
+
 audio_queue: queue.Queue[bytes] = queue.Queue()
 control_queue: queue.Queue[dict] = queue.Queue()
 
@@ -167,33 +177,43 @@ def main() -> None:
                         result.get("text", "")
                     ).strip()
 
-                    if recognized_text:
-                        print(
-                            f"[wake final] {recognized_text}",
-                            file=sys.stderr,
-                            flush=True,
-                        )
+                    result_type = "final"
 
                 else:
-                    partial_result = json.loads(
+                    result = json.loads(
                         wake_recognizer.PartialResult()
                     )
 
                     recognized_text = str(
-                        partial_result.get("partial", "")
+                        result.get("partial", "")
                     ).strip()
 
-                    if recognized_text:
-                        print(
-                            f"[wake parcial] {recognized_text}",
-                            file=sys.stderr,
-                            flush=True,
-                        )
+                    result_type = "parcial"
 
-                if (
+                if not recognized_text:
+                    continue
+
+                debug_log(
+                    f"[wake {result_type}] {recognized_text}",
+                )
+
+                matched = contains_wake_word(
                     recognized_text
-                    and contains_wake_word(recognized_text)
-                ):
+                )
+
+                debug_log(
+                    f"[wake match] {recognized_text!r} -> {matched}",
+                )
+
+                if matched:
+                    send_message({
+                        "type": "wake_detected",
+                        "text": recognized_text,
+                    })
+
+                    debug_log(
+                        "[wake] Wake word confirmada. Aguardando comando...",
+                    )
 
                     mode = "command"
 
@@ -208,25 +228,88 @@ def main() -> None:
 
                     clear_audio_queue()
 
+                    debug_log(
+                        "[wake] Wake word confirmada. Aguardando comando..."
+                    )
+
                 continue
 
             if mode == "command":
-                if command_recognizer.AcceptWaveform(data):
+                accepted = command_recognizer.AcceptWaveform(data)
+
+                if accepted:
                     result = json.loads(command_recognizer.Result())
+
                     text = str(result.get("text", "")).strip()
 
+                    debug_log(
+                        f"[command final] {text!r}",
+                    )
+
                     if text:
+                        send_message(
+                            {
+                                "type": "transcript",
+                                "text": text,
+                            }
+                        )
+
                         mode = "paused"
                         command_deadline = None
                         clear_audio_queue()
+
                         continue
-                if(command_deadline is not None and time.monotonic() >= command_deadline):
-                    final_result=json.loads(command_recognizer.FinalResult())
-                    text=str(final_result.get("text", "")).strip()
+
+                else:
+                    partial_result = json.loads(command_recognizer.PartialResult())
+
+                    partial_text = str(
+                        partial_result.get(
+                            "partial",
+                            "",
+                        )
+                    ).strip()
+
+                    if partial_text:
+                        debug_log(
+                            f"[command parcial] {partial_text}",
+                        )
+
+                if command_deadline is not None and time.monotonic() >= command_deadline:
+                    final_result = json.loads(command_recognizer.FinalResult())
+
+                    text = str(
+                        final_result.get(
+                            "text",
+                            "",
+                        )
+                    ).strip()
+
+                    debug_log(
+                        f"[command timeout] {text!r}",
+                    )
+
+                    if text:
+                        send_message(
+                            {
+                                "type": "transcript",
+                                "text": text,
+                            }
+                        )
+
+                    else:
+                        send_message(
+                            {
+                                "type": "timeout",
+                            }
+                        )
 
                     mode = "paused"
                     command_deadline = None
                     clear_audio_queue()
+
+                    continue
+
 
 if __name__ == "__main__":
     try:

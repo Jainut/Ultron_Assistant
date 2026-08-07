@@ -1,7 +1,6 @@
 import { unlink } from "node:fs/promises";
-
+import { OllamaService } from "./ai/ollama.service.ts";
 import { routeCommand } from "./assistant/command-router.ts";
-
 import { TextToSpeechService } from "./speech/text-to-speech.ts";
 import { SpeechToTextService } from "./speech/speech-to-text.ts";
 import { playAudio } from "./speech/audio_player.ts";
@@ -9,6 +8,7 @@ import { playAudio } from "./speech/audio_player.ts";
 
 const tts = new TextToSpeechService();
 const stt = new SpeechToTextService();
+const ai = new OllamaService();
 
 
 async function main(): Promise<void> {
@@ -53,16 +53,9 @@ async function main(): Promise<void> {
             }
 
             try {
-                const result = await routeCommand(
-                    command,
-                );
-
-                console.log(
-                    `Ultron> ${result.message}`,
-                );
-
-                const speechText =
-                    result.speech ?? result.message;
+                const response = await ai.chat(command);
+                console.log(`Ultron> ${response}`);
+                const speechText = response;
 
                 let audioPath: string | null = null;
 
