@@ -10,7 +10,7 @@ export async function openApp(appName: string): Promise<ToolResult> {
     if (!app) {
         return {
             success: false,
-            message: `Aplicativo não encontrado: ${appName}`,
+            message: `Aplicativo não encontrado}`,
         };
     }
 
@@ -22,16 +22,16 @@ export async function openApp(appName: string): Promise<ToolResult> {
 
             resolve({
                 success: true,
-                message: `Ok senhor, abrindo: ${appName}`,
+                message: `Ok, abrindo o aplicativo`,
             });
         });
 
         child.once("error", (err) => {
-            console.error(`Erro ao abrir o aplicativo: ${err.message}`);
+            console.error(`Erro ao abrir o aplicativo`);
 
             resolve({
                 success: false,
-                message: `Não consegui abrir o aplicativo: ${err.message}, senhor`,
+                message: `Não consegui abrir o aplicativo, senhor`,
             });
         });
     });

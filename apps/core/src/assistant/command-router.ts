@@ -58,6 +58,6 @@ export async function routeCommand(command: string): Promise<ToolResult> {
 
     return {
         success: true,
-        message: `Comando não reconhecido: ${command}`,
+        message: `Comando não reconhecido`,
     }
 }
