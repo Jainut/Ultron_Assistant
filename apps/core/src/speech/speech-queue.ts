@@ -8,10 +8,13 @@ import {
     playAudio,
     stopAudio,
 } from "./audio_player.ts";
+import { performance } from "node:perf_hooks";
+import { perf } from "../utils/performance.ts";
 
 
 interface SpeechQueueOptions {
     onFirstPlayback?: () => void;
+    onPlaybackEnd?: () => void;
 }
 
 
@@ -32,6 +35,8 @@ export class SpeechQueue {
      * que a resposta já foi cancelada.
      */
     private generation = 0;
+    private activeSynthesisController: AbortController | null = null;
+    private speakingAnnounced = false;
 
     private readonly idleResolvers:
         Array<() => void> = [];
@@ -84,6 +89,8 @@ export class SpeechQueue {
          * pertencente à resposta anterior.
          */
         this.generation++;
+        this.activeSynthesisController?.abort();
+        this.activeSynthesisController = null;
 
         /*
          * Remove textos ainda esperando
@@ -168,10 +175,21 @@ export class SpeechQueue {
                     this.generation;
 
                 try {
+                    const synthesisController = new AbortController();
+                    this.activeSynthesisController = synthesisController;
+                    const synthesisStartedAt = performance.now();
                     const audioPath =
                         await this.tts.synthesize(
                             text,
+                            synthesisController.signal,
                         );
+
+                    if (!this.firstPlaybackStarted) {
+                        perf.record(
+                            "TTS first chunk",
+                            performance.now() - synthesisStartedAt,
+                        );
+                    }
 
                     /*
                      * Houve interrupt()
@@ -205,11 +223,20 @@ export class SpeechQueue {
                     void this.startPlayback();
 
                 } catch (error) {
+                    if (
+                        error instanceof DOMException
+                        && error.name === "AbortError"
+                    ) {
+                        continue;
+                    }
+
                     console.error(
                         "[SpeechQueue] " +
                         "Erro ao sintetizar:",
                         error,
                     );
+                } finally {
+                    this.activeSynthesisController = null;
                 }
             }
 
@@ -261,11 +288,17 @@ export class SpeechQueue {
 
                     this.options
                         .onFirstPlayback?.();
+                    this.speakingAnnounced = true;
                 }
 
                 try {
+                    const playbackStartedAt = performance.now();
                     await playAudio(
                         audioPath,
+                    );
+                    perf.record(
+                        "Audio playback",
+                        performance.now() - playbackStartedAt,
                     );
 
                 } catch (error) {
@@ -332,6 +365,11 @@ export class SpeechQueue {
                 this.idleResolvers.shift();
 
             resolve?.();
+        }
+
+        if (this.speakingAnnounced) {
+            this.speakingAnnounced = false;
+            this.options.onPlaybackEnd?.();
         }
     }
 }

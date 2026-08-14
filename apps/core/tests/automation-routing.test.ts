@@ -62,6 +62,10 @@ test("prepara automações simples localmente sem depender do Ollama", () => {
         { name: "control_tv", args: { action: "on" } },
     );
     assert.deepEqual(
+        parseDirectAutomationCommand("Pareie a televisão."),
+        { name: "control_tv", args: { action: "pair" } },
+    );
+    assert.deepEqual(
         parseDirectAutomationCommand("Desligue o ventilador."),
         {
             name: "control_home_device",
@@ -73,6 +77,16 @@ test("prepara automações simples localmente sem depender do Ollama", () => {
         {
             name: "control_home_device",
             args: { device: "abajur da sala", action: "on" },
+        },
+    );
+});
+
+test("interpreta ajuste percentual da luz sem exigir a palavra brilho", () => {
+    assert.deepEqual(
+        parseDirectAutomationCommand("Diminui a luz para 20%."),
+        {
+            name: "control_light",
+            args: { action: "brightness", brightness: 20 },
         },
     );
 });

@@ -18,24 +18,39 @@ CLOUD_FILE = ROOT_DIR / "tinytuya.json"
 
 DEVICE_NAME = "Smart color"
 
+_cloud_instance = None
+_cloud_device_id: str | None = None
+_cloud_state: dict = {}
 
-def cloud_fallback(arguments: list[str]) -> dict:
+
+def get_cloud():
+    global _cloud_instance
+    global _cloud_device_id
+
+    if _cloud_instance is not None and _cloud_device_id:
+        return _cloud_instance, _cloud_device_id
+
     if not CLOUD_FILE.exists():
         raise FileNotFoundError(
             f"Configuração Tuya Cloud não encontrada: {CLOUD_FILE}"
         )
 
-    config = json.loads(
-        CLOUD_FILE.read_text(encoding="utf-8")
-    )
-    cloud = tinytuya.Cloud(
+    config = json.loads(CLOUD_FILE.read_text(encoding="utf-8"))
+    _cloud_instance = tinytuya.Cloud(
         apiRegion=config["apiRegion"],
         apiKey=config["apiKey"],
         apiSecret=config["apiSecret"],
         apiDeviceID=config["apiDeviceID"],
     )
-    device_id = config["apiDeviceID"]
+    _cloud_device_id = config["apiDeviceID"]
+    return _cloud_instance, _cloud_device_id
+
+
+def cloud_fallback(arguments: list[str]) -> dict:
+    global _cloud_state
+    cloud, device_id = get_cloud()
     action = arguments[0].lower()
+    optimistic_updates: dict = {}
 
     if action == "status":
         result = cloud.getstatus(device_id)
@@ -43,6 +58,7 @@ def cloud_fallback(arguments: list[str]) -> dict:
         commands: list[dict] = []
 
         if action in ("on", "off"):
+            optimistic_updates["switch_led"] = action == "on"
             commands.append({
                 "code": "switch_led",
                 "value": action == "on",
@@ -50,6 +66,7 @@ def cloud_fallback(arguments: list[str]) -> dict:
 
         elif action == "brightness":
             brightness = int(arguments[1])
+            optimistic_updates["bright_value_v2"] = max(10, brightness * 10)
             commands.append({
                 "code": "bright_value_v2",
                 "value": max(10, brightness * 10),
@@ -58,6 +75,11 @@ def cloud_fallback(arguments: list[str]) -> dict:
         elif action == "white":
             brightness = int(arguments[1])
             temperature = int(arguments[2])
+            optimistic_updates.update({
+                "work_mode": "white",
+                "bright_value_v2": max(10, brightness * 10),
+                "temp_value_v2": temperature * 10,
+            })
             commands.extend([
                 {"code": "work_mode", "value": "white"},
                 {
@@ -77,6 +99,14 @@ def cloud_fallback(arguments: list[str]) -> dict:
                 green / 255,
                 blue / 255,
             )
+            optimistic_updates.update({
+                "work_mode": "colour",
+                "colour_data_v2": {
+                    "h": round(hue * 360),
+                    "s": round(saturation * 1000),
+                    "v": round(value * 1000),
+                },
+            })
             commands.extend([
                 {"code": "work_mode", "value": "colour"},
                 {
@@ -102,25 +132,38 @@ def cloud_fallback(arguments: list[str]) -> dict:
             f"Fallback Tuya Cloud falhou: {result}"
         )
 
-    time.sleep(0.5)
-    status_result = cloud.getstatus(device_id)
-    state = {
-        item["code"]: item.get("value")
-        for item in status_result.get("result", [])
-        if isinstance(item, dict) and "code" in item
-    } if isinstance(status_result, dict) else {}
+    fast_confirmation = (
+        action != "status"
+        and os.getenv("ULTRON_TUYA_FAST_CONFIRM", "0") == "1"
+    )
 
-    if action == "on" and state.get("switch_led") is not True:
+    if fast_confirmation:
+        _cloud_state.update(optimistic_updates)
+        state = dict(_cloud_state)
+    else:
+        if action != "status":
+            time.sleep(0.5)
+
+        status_result = result if action == "status" else cloud.getstatus(device_id)
+        state = {
+            item["code"]: item.get("value")
+            for item in status_result.get("result", [])
+            if isinstance(item, dict) and "code" in item
+        } if isinstance(status_result, dict) else {}
+        _cloud_state = state
+
+    if not fast_confirmation and action == "on" and state.get("switch_led") is not True:
         raise RuntimeError("A nuvem Tuya não confirmou que a lâmpada ligou.")
 
-    if action == "off" and state.get("switch_led") is not False:
+    if not fast_confirmation and action == "off" and state.get("switch_led") is not False:
         raise RuntimeError("A nuvem Tuya não confirmou que a lâmpada desligou.")
 
     return {
         "success": True,
         "action": action,
         "transport": "tuya_cloud",
-        "confirmed": True,
+        "confirmed": not fast_confirmation,
+        "optimistic": fast_confirmation,
         "state": {
             "is_on": state.get("switch_led"),
             "mode": state.get("work_mode"),
@@ -128,6 +171,29 @@ def cloud_fallback(arguments: list[str]) -> dict:
             "temperature": state.get("temp_value_v2"),
         },
     }
+
+
+def run_cloud_server() -> None:
+    for line in sys.stdin:
+        request = None
+
+        try:
+            request = json.loads(line)
+            arguments = [str(value) for value in request.get("arguments", [])]
+            result = cloud_fallback(arguments)
+            result.update({
+                "id": request.get("id"),
+                "type": "result",
+            })
+            send(result)
+
+        except Exception as error:
+            send({
+                "id": request.get("id") if request else None,
+                "type": "result",
+                "success": False,
+                "error": str(error),
+            })
 
 
 def ensure_tuya_success(
@@ -491,6 +557,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--cloud-server":
+        run_cloud_server()
+        raise SystemExit(0)
+
     try:
         main()
 

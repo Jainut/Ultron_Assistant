@@ -19,6 +19,10 @@
     "typescript": "^5.0.0"
   },
   "dependencies": {
+    "@kud/androidtv-remote": "^0.1.2",
     "ollama": "^0.6.3"
+  },
+  "overrides": {
+    "protobufjs": "7.6.5"
   }
 }

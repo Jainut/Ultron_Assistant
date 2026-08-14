@@ -8,17 +8,22 @@ import { readFile, unlink } from "node:fs/promises";
 import path from "node:path";
 import { runtimeConfig, servicePath } from "../config/runtime.ts";
 import { debugLog, serviceError } from "../utils/debug.ts";
+import { perf } from "../utils/performance.ts";
 
 
 interface CaptureMessage {
     type:
     | "ready"
+    | "input_device"
     | "speech_start"
     | "audio"
     | "error";
 
     path?: string;
     error?: string;
+    device?: number;
+    name?: string;
+    fallback?: boolean;
 }
 
 
@@ -32,6 +37,7 @@ export class SpeechToTextService {
 
     private pendingResolve: ((text: string) => void) | null = null;
     private pendingReject: ((error: Error) => void) | null = null;
+    private readonly recentTranscriptions: string[] = [];
 
 
     private readonly whisperPort = runtimeConfig.whisperPort;
@@ -98,7 +104,7 @@ export class SpeechToTextService {
                 String(this.whisperPort),
 
                 "-l",
-                "pt",
+                runtimeConfig.whisperLanguage,
 
                 "-t",
                     String(runtimeConfig.whisperThreads),
@@ -107,18 +113,19 @@ export class SpeechToTextService {
 
                 "-nt",
 
+                "--beam-size",
+                String(runtimeConfig.whisperBeamSize),
+
+                "--best-of",
+                String(runtimeConfig.whisperBestOf),
+
+                "--no-speech-thold",
+                String(runtimeConfig.whisperNoSpeechThreshold),
+
+                "--carry-initial-prompt",
+
                 "--prompt",
-                [
-                    "Ultron",
-                    "Ollama",
-                    "Kokoro",
-                    "TypeScript",
-                    "JavaScript",
-                    "Visual Studio Code",
-                    "VS Code",
-                    "Zen Browser",
-                    "PowerShell",
-                ].join(", "),
+                runtimeConfig.whisperTerms.join(", "),
             ],
             {
                 cwd: whisperDir,
@@ -302,6 +309,15 @@ export class SpeechToTextService {
             return;
         }
 
+        if (message.type === "input_device") {
+            debugLog("[STT] Dispositivo de entrada:", {
+                id: message.device,
+                name: message.name,
+                fallback: message.fallback,
+            });
+            return;
+        }
+
         if (
             message.type ===
             "speech_start"
@@ -411,13 +427,18 @@ export class SpeechToTextService {
 
             form.append(
                 "language",
-                "pt"
+                runtimeConfig.whisperLanguage
             );
 
             form.append(
                 "temperature",
-                "0.0"
+                String(runtimeConfig.whisperTemperature)
             );
+
+            form.append("temperature_inc", "0.2");
+            form.append("beam_size", String(runtimeConfig.whisperBeamSize));
+            form.append("best_of", String(runtimeConfig.whisperBestOf));
+            form.append("no_speech_thold", String(runtimeConfig.whisperNoSpeechThreshold));
 
             form.append(
                 "response_format",
@@ -437,25 +458,23 @@ export class SpeechToTextService {
             form.append(
                 "prompt",
                 [
-                    "Ultron",
-                    "Ollama",
-                    "Kokoro",
-                    "TypeScript",
-                    "JavaScript",
-                    "Visual Studio Code",
-                    "VS Code",
-                    "Zen Browser",
-                    "PowerShell",
+                    ...runtimeConfig.whisperTerms,
+                    ...this.recentTranscriptions.slice(-2),
                 ].join(", "),
             );
 
+            form.append("carry_initial_prompt", "true");
 
-            const response = await fetch(
-                this.whisperUrl,
-                {
-                    method: "POST",
-                    body: form,
-                },
+
+            const response = await perf.measure(
+                "STT transcription",
+                () => fetch(
+                    this.whisperUrl,
+                    {
+                        method: "POST",
+                        body: form,
+                    },
+                ),
             );
 
 
@@ -471,8 +490,15 @@ export class SpeechToTextService {
 
             const text =
                 await response.text();
+            const transcription = text.trim();
 
-            return text.trim();
+            if (transcription) {
+                this.recentTranscriptions.push(transcription);
+                if (this.recentTranscriptions.length > 4) this.recentTranscriptions.shift();
+                debugLog(`[STT] "${transcription}"`);
+            }
+
+            return transcription;
 
         } finally {
             await unlink(
@@ -529,6 +555,13 @@ export class SpeechToTextService {
     resume(): void {
         this.sendCapture({
             type: "resume",
+        });
+    }
+
+    setPlaybackActive(active: boolean): void {
+        this.sendCapture({
+            type: "playback",
+            active,
         });
     }
 

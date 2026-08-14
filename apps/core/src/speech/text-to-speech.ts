@@ -12,6 +12,7 @@ interface PendingRequest {
     resolve: (audioPath: string) => void;
     reject: (error: Error) => void;
     startedAt: number;
+    removeAbortListener?: () => void;
 }
 
 interface ServiceMessage {
@@ -151,6 +152,7 @@ export class TextToSpeechService {
         }
 
         this.pending.delete(message.id);
+        request.removeAbortListener?.();
 
         const elapsed =
             (performance.now() - request.startedAt) / 1000;
@@ -169,7 +171,7 @@ export class TextToSpeechService {
         );
     }
 
-    async synthesize(text: string): Promise<string> {
+    async synthesize(text: string, signal?: AbortSignal): Promise<string> {
         if (!text.trim()) {
             throw new Error("O texto da fala está vazio.");
         }
@@ -187,12 +189,35 @@ export class TextToSpeechService {
             `speech-${id}.wav`,
         );
 
+        signal?.throwIfAborted();
+
         return new Promise((resolve, reject) => {
+            const abort = (): void => {
+                const request = this.pending.get(id);
+
+                if (!request) {
+                    return;
+                }
+
+                this.pending.delete(id);
+                this.child?.stdin.write(`${JSON.stringify({
+                    id,
+                    type: "cancel",
+                })}\n`);
+                reject(new DOMException("Síntese cancelada.", "AbortError"));
+            };
+            const removeAbortListener = signal
+                ? (): void => signal.removeEventListener("abort", abort)
+                : undefined;
+
             this.pending.set(id, {
                 resolve,
                 reject,
                 startedAt: performance.now(),
+                removeAbortListener,
             });
+
+            signal?.addEventListener("abort", abort, { once: true });
 
             const message = {
                 id,
@@ -212,6 +237,14 @@ export class TextToSpeechService {
             return;
         }
 
+        const error = new Error("O serviço de voz foi encerrado.");
+
+        for (const request of this.pending.values()) {
+            request.removeAbortListener?.();
+            request.reject(error);
+        }
+
+        this.pending.clear();
         this.child.stdin.end();
         this.child.kill();
         this.child = null;

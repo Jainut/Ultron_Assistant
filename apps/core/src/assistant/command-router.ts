@@ -2,12 +2,16 @@ import type { ToolResult } from "../../shared/types.js";
 import { getTime } from "../../tools/clock.tool.js";
 import { openApp } from "../../tools/open-app.tool.js";
 import { clearTerminal } from "../../tools/clear-terminal.tool.ts";
+import type { ToolContext } from "../tools/tool.ts";
 
 function normalizeCommand(command: string): string {
     return command.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
 }
 
-export async function routeCommand(command: string): Promise<ToolResult> {
+export async function routeCommand(
+    command: string,
+    context: ToolContext = {},
+): Promise<ToolResult> {
     const normalizedCommand = normalizeCommand(command);
 
     if (!normalizedCommand) {
@@ -49,7 +53,7 @@ export async function routeCommand(command: string): Promise<ToolResult> {
     if (openMatch) {
         const appName = openMatch[1];
 
-        return openApp(appName);
+        return openApp(appName, context);
     }
 
     if (isClearTerminalCommand) {

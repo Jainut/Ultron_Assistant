@@ -8,6 +8,8 @@ import {
     findDiscoveredDevice,
     findDiscoveredTelevision,
 } from "../src/automation/device-discovery.ts";
+import { androidTvRemote } from "../src/automation/android-tv-remote.ts";
+import type { ToolContext } from "../src/tools/tool.ts";
 
 type PowerAction = "on" | "off" | "toggle" | "status" | "open" | "close";
 export type TelevisionAction =
@@ -17,7 +19,8 @@ export type TelevisionAction =
     | "mute"
     | "unmute"
     | "play"
-    | "pause";
+    | "pause"
+    | "pair";
 
 interface HomeAssistantConfig {
     url: string;
@@ -87,7 +90,9 @@ async function homeAssistantRequest(
             "Content-Type": "application/json",
             ...init?.headers,
         },
-        signal: AbortSignal.timeout(8_000),
+        signal: init?.signal
+            ? AbortSignal.any([init.signal, AbortSignal.timeout(8_000)])
+            : AbortSignal.timeout(8_000),
     });
     const body = await response.text();
 
@@ -102,9 +107,10 @@ async function callHomeAssistant(
     config: HomeAssistantConfig,
     entityId: string,
     action: PowerAction | TelevisionAction,
+    signal?: AbortSignal,
 ): Promise<unknown> {
     if (action === "status") {
-        return homeAssistantRequest(config, `/api/states/${entityId}`);
+        return homeAssistantRequest(config, `/api/states/${entityId}`, { signal });
     }
 
     const domain = entityId.split(".")[0];
@@ -138,7 +144,7 @@ async function callHomeAssistant(
     return homeAssistantRequest(
         config,
         `/api/services/${domain}/${service}`,
-        { method: "POST", body: JSON.stringify(body) },
+        { method: "POST", body: JSON.stringify(body), signal },
     );
 }
 
@@ -172,14 +178,18 @@ async function wakeOnLan(
     });
 }
 
-export async function controlTelevision(action: TelevisionAction): Promise<string> {
+export async function controlTelevision(
+    action: TelevisionAction,
+    context: ToolContext = {},
+): Promise<string> {
     try {
+        context.signal?.throwIfAborted();
         const config = await loadConfig();
         const homeAssistant = config.homeAssistant;
         const entityId = homeAssistant?.entities.television;
 
-        if (homeAssistant && entityId) {
-            const state = await callHomeAssistant(homeAssistant, entityId, action);
+        if (homeAssistant && entityId && action !== "pair") {
+            const state = await callHomeAssistant(homeAssistant, entityId, action, context.signal);
             return asResult({
                 success: true,
                 device: "television",
@@ -204,8 +214,27 @@ export async function controlTelevision(action: TelevisionAction): Promise<strin
         }
 
         const discovered = await findDiscoveredTelevision();
+        context.signal?.throwIfAborted();
 
         if (discovered) {
+            if (action === "pair") {
+                if (discovered.protocol !== "android-tv") {
+                    throw new Error(`${discovered.name} nÃ£o usa o pareamento Android TV.`);
+                }
+
+                const state = await androidTvRemote.beginPairing(discovered, context.signal);
+                const message = typeof state === "object" && state && "message" in state
+                    ? String(state.message)
+                    : `Pareamento iniciado com ${discovered.name}.`;
+                return asResult({
+                    success: true,
+                    device: discovered.name,
+                    action,
+                    state,
+                    message,
+                });
+            }
+
             if (action === "on" && discovered.mac) {
                 await wakeOnLan(
                     discovered.mac,
@@ -219,7 +248,7 @@ export async function controlTelevision(action: TelevisionAction): Promise<strin
                 });
             }
 
-            const state = await controlDiscoveredDevice(discovered, action);
+            const state = await controlDiscoveredDevice(discovered, action, context.signal);
             return asResult({
                 success: true,
                 device: discovered.name,
@@ -236,6 +265,7 @@ export async function controlTelevision(action: TelevisionAction): Promise<strin
             message: "Nenhuma TV controlável foi encontrada automaticamente na rede local.",
         });
     } catch (error) {
+        if (context.signal?.aborted) throw error;
         return asResult({
             success: false,
             device: "television",
@@ -245,11 +275,50 @@ export async function controlTelevision(action: TelevisionAction): Promise<strin
     }
 }
 
+export async function submitTelevisionPairingCode(
+    code: string,
+    context: ToolContext = {},
+): Promise<string> {
+    try {
+        const state = await androidTvRemote.submitPairingCode(code, context.signal);
+        const actionMessages: Partial<Record<TelevisionAction, string>> = {
+            on: "TV pareada e ligada.",
+            off: "TV pareada e desligada.",
+            toggle: "TV pareada e acionada.",
+            volume_up: "TV pareada e volume aumentado.",
+            volume_down: "TV pareada e volume diminuÃ­do.",
+            mute: "TV pareada e silenciada.",
+            unmute: "TV pareada e som restaurado.",
+            play: "TV pareada e reproduÃ§Ã£o iniciada.",
+            pause: "TV pareada e reproduÃ§Ã£o pausada.",
+        };
+        return asResult({
+            success: true,
+            device: state.device,
+            action: state.executedAction ?? "pair",
+            state,
+            message: state.executedAction
+                ? actionMessages[state.executedAction] ?? "TV pareada e comando executado."
+                : "TV pareada com o Ultron.",
+        });
+    } catch (error) {
+        if (context.signal?.aborted) throw error;
+        return asResult({
+            success: false,
+            device: "television",
+            action: "pair",
+            message: error instanceof Error ? error.message : String(error),
+        });
+    }
+}
+
 export async function controlHomeDevice(
     device: string,
     action: PowerAction,
+    context: ToolContext = {},
 ): Promise<string> {
     try {
+        context.signal?.throwIfAborted();
         const config = await loadConfig();
         const homeAssistant = config.homeAssistant;
 
@@ -259,7 +328,7 @@ export async function controlHomeDevice(
                 .find(([name]) => normalize(name) === normalizedDevice);
 
             if (entityEntry) {
-                const state = await callHomeAssistant(homeAssistant, entityEntry[1], action);
+                const state = await callHomeAssistant(homeAssistant, entityEntry[1], action, context.signal);
                 return asResult({
                     success: true,
                     device,
@@ -271,9 +340,10 @@ export async function controlHomeDevice(
         }
 
         const discovered = await findDiscoveredDevice(device);
+        context.signal?.throwIfAborted();
 
         if (discovered) {
-            const state = await controlDiscoveredDevice(discovered, action);
+            const state = await controlDiscoveredDevice(discovered, action, context.signal);
             return asResult({
                 success: true,
                 device: discovered.name,
@@ -290,6 +360,7 @@ export async function controlHomeDevice(
             message: `Não encontrei automaticamente um dispositivo chamado ${device} na rede local.`,
         });
     } catch (error) {
+        if (context.signal?.aborted) throw error;
         return asResult({
             success: false,
             device,

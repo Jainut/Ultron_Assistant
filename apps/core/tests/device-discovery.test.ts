@@ -3,9 +3,11 @@ import test from "node:test";
 
 import {
     parseArpTable,
+    parseCastDeviceDescription,
     parseMdnsResponse,
     parseSsdpResponse,
 } from "../src/automation/device-discovery.ts";
+import { waitForAndroidTvHandshake } from "../src/automation/android-tv-remote.ts";
 
 test("interpreta aparelhos encontrados na tabela ARP do Windows", () => {
     const entries = parseArpTable(`
@@ -40,4 +42,48 @@ test("interpreta anúncios SSDP sem depender da rede", () => {
 
 test("ignora pacotes mDNS inválidos sem interromper o scan", () => {
     assert.deepEqual(parseMdnsResponse(Buffer.alloc(0)), []);
+});
+
+test("classifica uma TCL com Android TV Remote como televisão controlável", () => {
+    const device = parseCastDeviceDescription(
+        "192.168.0.6",
+        `<?xml version="1.0"?>
+        <root><device>
+          <friendlyName>TV da sala de estar</friendlyName>
+          <manufacturer>TCL</manufacturer>
+          <modelName>BeyondTV</modelName>
+          <deviceType>urn:dial-multiscreen-org:device:dial:1</deviceType>
+        </device></root>`,
+        true,
+    );
+
+    assert.equal(device?.name, "TV da sala de estar");
+    assert.equal(device?.manufacturer, "TCL");
+    assert.equal(device?.model, "BeyondTV");
+    assert.equal(device?.kind, "television");
+    assert.equal(device?.protocol, "android-tv");
+});
+
+test("aguarda o evento ready depois da conexão TLS da Android TV", async () => {
+    let ready = false;
+    let resolveReady = (): void => undefined;
+    const readyPromise = new Promise<void>(resolve => {
+        resolveReady = resolve;
+    });
+
+    setTimeout(() => {
+        ready = true;
+        resolveReady();
+    }, 20);
+
+    const connected = await waitForAndroidTvHandshake(
+        Promise.resolve(true),
+        readyPromise,
+        () => ready,
+        undefined,
+        100,
+        100,
+    );
+
+    assert.equal(connected, true);
 });

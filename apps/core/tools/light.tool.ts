@@ -1,6 +1,10 @@
 import { spawn } from "node:child_process";
 import path from "node:path";
 import { servicePath } from "../src/config/runtime.ts";
+import type { ToolContext } from "../src/tools/tool.ts";
+import { tuyaCloudClient } from "../src/automation/tuya-cloud-client.ts";
+import { perf } from "../src/utils/performance.ts";
+import { debugLog } from "../src/utils/debug.ts";
 
 
 export type LightAction =
@@ -31,8 +35,10 @@ let preferCloudTransport = false;
 
 
 export async function controlLight(
-    options: LightOptions
+    options: LightOptions,
+    context: ToolContext = {},
 ): Promise<string> {
+    context.signal?.throwIfAborted();
     const serviceDir = servicePath("light-tuya");
 
     const pythonExe = path.join(
@@ -88,9 +94,24 @@ export async function controlLight(
         );
     }
 
+    if (preferCloudTransport) {
+        try {
+            return await perf.measure(
+                "Light API request",
+                () => tuyaCloudClient.request(args.slice(1), context.signal),
+            );
+        } catch (error) {
+            if (context.signal?.aborted) throw error;
+            preferCloudTransport = false;
+            debugLog("[LIGHT] Sessão persistente falhou; usando fluxo compatível.", error);
+        }
+    }
+
 
     return new Promise(
         (resolve, reject) => {
+            let aborted = false;
+            const processStartedAt = performance.now();
             const childProcess =
                 spawn(
                     pythonExe,
@@ -100,6 +121,8 @@ export async function controlLight(
                         windowsHide: true,
                         env: {
                             ...process.env,
+                            PYTHONIOENCODING: "utf-8",
+                            PYTHONUTF8: "1",
                             ULTRON_TUYA_SKIP_LOCAL:
                                 preferCloudTransport
                                     ? "1"
@@ -107,6 +130,12 @@ export async function controlLight(
                         },
                     },
                 );
+
+            const abort = (): void => {
+                aborted = true;
+                childProcess.kill();
+            };
+            context.signal?.addEventListener("abort", abort, { once: true });
 
 
             let stdout = "";
@@ -140,6 +169,13 @@ export async function controlLight(
             childProcess.on(
                 "close",
                 code => {
+                    context.signal?.removeEventListener("abort", abort);
+
+                    if (aborted) {
+                        reject(new DOMException("Controle da lâmpada cancelado.", "AbortError"));
+                        return;
+                    }
+
                     if (code !== 0) {
                         reject(
                             new Error(
@@ -159,10 +195,15 @@ export async function controlLight(
 
                         preferCloudTransport =
                             result.transport === "tuya_cloud";
+
+                        if (preferCloudTransport) {
+                            tuyaCloudClient.start();
+                        }
                     } catch {
                         // Compatibilidade com respostas antigas do servico.
                     }
 
+                    perf.record("Light process + API", performance.now() - processStartedAt);
                     resolve(
                         stdout.trim()
                     );
@@ -170,4 +211,8 @@ export async function controlLight(
             );
         },
     );
+}
+
+export function stopLightService(): void {
+    tuyaCloudClient.stop();
 }

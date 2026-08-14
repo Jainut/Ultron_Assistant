@@ -17,3 +17,4 @@ services/light-tuya/tuya-raw.json
 ultron.env.cmd
 config/home.devices.json
 data/discovered-devices.json
+data/android-tv-pairings.json

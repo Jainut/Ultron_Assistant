@@ -17,6 +17,29 @@ class PerformanceTracker {
         this.timers.set(name, performance.now());
     }
 
+    record(name: string, elapsed: number): number {
+        if (debugEnabled) {
+            console.log(
+                `[PERF] ${name.padEnd(24, ".")} ${elapsed.toFixed(0)}ms`,
+            );
+        }
+
+        return elapsed;
+    }
+
+    async measure<T>(
+        name: string,
+        operation: () => Promise<T> | T,
+    ): Promise<T> {
+        const startedAt = performance.now();
+
+        try {
+            return await operation();
+        } finally {
+            this.record(name, performance.now() - startedAt);
+        }
+    }
+
     end(name: string) {
         const start = this.timers.get(name);
 
@@ -29,11 +52,7 @@ class PerformanceTracker {
 
         const elapsed = performance.now() - start;
 
-        if (debugEnabled) {
-            console.log(
-                `[PERF] ${name.padEnd(20, ".")} ${elapsed.toFixed(0)}ms`
-            );
-        }
+        this.record(name, elapsed);
 
         this.timers.delete(name);
 

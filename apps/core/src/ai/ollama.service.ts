@@ -16,6 +16,10 @@ import {
     controlTelevision,
     type TelevisionAction,
 } from "../../tools/home-automation.tool.ts";
+import { fileSystem } from "../filesystem/file-system-service.ts";
+import { debugLog } from "../utils/debug.ts";
+import { perf } from "../utils/performance.ts";
+import type { ToolContext } from "../tools/tool.ts";
 
 
 const MODEL = runtimeConfig.ollamaModel;
@@ -71,7 +75,7 @@ Você possui exatamente estas ferramentas:
 Consulta o horário atual.
 
 2. open_application
-Abre um aplicativo cadastrado.
+Localiza e abre automaticamente um aplicativo instalado.
 
 3. clear_terminal
 Limpa o terminal.
@@ -101,6 +105,12 @@ Controla uma televisão cadastrada: energia, volume, mute e reprodução.
 Controla dispositivos residenciais cadastrados, como ventiladores, tomadas e outros aparelhos.
 
 Nunca afirme que TV ou outro aparelho foi controlado sem sucesso confirmado pela ferramenta correspondente.
+
+7. Ferramentas de arquivos e pastas
+Use get_current_directory, list_directory, change_directory, create_directory,
+find_directory, find_file, open_directory, open_file e open_in_editor para
+navegar no computador. A pasta atual é contextual: expressões como "aqui",
+"isso", "entra" e "volta" podem depender da operação anterior.
 
 Nunca use emojis.
 
@@ -246,11 +256,141 @@ const tools: Tool[] = [
                         type: "string",
                         enum: [
                             "on", "off", "status", "volume_up", "volume_down",
-                            "mute", "unmute", "play", "pause",
+                            "mute", "unmute", "play", "pause", "pair",
                         ],
                     },
                 },
                 required: ["action"],
+            },
+        },
+    },
+
+    {
+        type: "function",
+        function: {
+            name: "close_application",
+            description: "Fecha um aplicativo em execução quando o usuário pedir explicitamente.",
+            parameters: {
+                type: "object",
+                properties: { application: { type: "string" } },
+                required: ["application"],
+            },
+        },
+    },
+
+    {
+        type: "function",
+        function: {
+            name: "get_current_directory",
+            description: "Obtém a pasta de trabalho contextual atual.",
+            parameters: { type: "object", properties: {}, required: [] },
+        },
+    },
+    {
+        type: "function",
+        function: {
+            name: "list_directory",
+            description: "Lista o conteúdo da pasta atual ou de outra pasta.",
+            parameters: {
+                type: "object",
+                properties: { path: { type: "string" } },
+                required: [],
+            },
+        },
+    },
+    {
+        type: "function",
+        function: {
+            name: "change_directory",
+            description: "Entra em uma pasta ou volta para a pasta anterior.",
+            parameters: {
+                type: "object",
+                properties: { path: { type: "string" } },
+                required: ["path"],
+            },
+        },
+    },
+    {
+        type: "function",
+        function: {
+            name: "create_directory",
+            description: "Cria uma pasta dentro da pasta atual.",
+            parameters: {
+                type: "object",
+                properties: { name: { type: "string" } },
+                required: ["name"],
+            },
+        },
+    },
+    {
+        type: "function",
+        function: {
+            name: "find_directory",
+            description: "Busca uma pasta nos locais prioritários indexados.",
+            parameters: {
+                type: "object",
+                properties: { query: { type: "string" } },
+                required: ["query"],
+            },
+        },
+    },
+    {
+        type: "function",
+        function: {
+            name: "find_file",
+            description: "Busca um arquivo nos locais prioritários indexados.",
+            parameters: {
+                type: "object",
+                properties: { query: { type: "string" } },
+                required: ["query"],
+            },
+        },
+    },
+    {
+        type: "function",
+        function: {
+            name: "open_directory",
+            description: "Abre uma pasta no Explorer.",
+            parameters: {
+                type: "object",
+                properties: { path: { type: "string" } },
+                required: [],
+            },
+        },
+    },
+    {
+        type: "function",
+        function: {
+            name: "open_file",
+            description: "Abre um arquivo no aplicativo padrão.",
+            parameters: {
+                type: "object",
+                properties: { path: { type: "string" } },
+                required: ["path"],
+            },
+        },
+    },
+    {
+        type: "function",
+        function: {
+            name: "open_in_editor",
+            description: "Abre a pasta ou arquivo atual no Visual Studio Code.",
+            parameters: {
+                type: "object",
+                properties: { path: { type: "string" } },
+                required: [],
+            },
+        },
+    },
+    {
+        type: "function",
+        function: {
+            name: "open_in_explorer",
+            description: "Mostra um arquivo ou pasta no Explorer.",
+            parameters: {
+                type: "object",
+                properties: { path: { type: "string" } },
+                required: [],
             },
         },
     },
@@ -281,11 +421,14 @@ const tools: Tool[] = [
 async function executeTool(
     name: string,
     args: Record<string, unknown>,
+    context: ToolContext = {},
 ): Promise<string> {
+    context.signal?.throwIfAborted();
     switch (name) {
         case "get_current_time": {
             const result = await routeCommand(
                 "que horas são",
+                context,
             );
 
             return result.message;
@@ -302,6 +445,7 @@ async function executeTool(
 
             const result = await routeCommand(
                 `abra ${application}`,
+                context,
             );
 
             return result.message;
@@ -311,6 +455,11 @@ async function executeTool(
             const result = await clearTerminal();
 
             return result.message;
+        }
+
+        case "close_application": {
+            const { closeApp } = await import("../../tools/open-app.tool.ts");
+            return (await closeApp(String(args.application ?? ""), context)).message;
         }
 
         case "control_light": {
@@ -332,12 +481,43 @@ async function executeTool(
 
                 temperature:
                     args.temperature as number | undefined,
-            });
+            }, context);
         }
+
+        case "get_current_directory":
+            return fileSystem.getCurrentDirectory().message;
+
+        case "list_directory":
+            return (await fileSystem.listDirectory(String(args.path ?? "") || undefined, context)).message;
+
+        case "change_directory":
+            return (await fileSystem.changeDirectory(String(args.path ?? ""), context)).message;
+
+        case "create_directory":
+            return (await fileSystem.createDirectory(String(args.name ?? ""), context)).message;
+
+        case "find_directory":
+            return (await fileSystem.findDirectory(String(args.query ?? ""), context)).message;
+
+        case "find_file":
+            return (await fileSystem.findFile(String(args.query ?? ""), context)).message;
+
+        case "open_directory":
+            return (await fileSystem.openDirectory(String(args.path ?? "") || undefined, context)).message;
+
+        case "open_file":
+            return (await fileSystem.openFile(String(args.path ?? ""), context)).message;
+
+        case "open_in_editor":
+            return (await fileSystem.openInEditor(String(args.path ?? "") || undefined, context)).message;
+
+        case "open_in_explorer":
+            return (await fileSystem.openInExplorer(String(args.path ?? "") || undefined, context)).message;
 
         case "control_tv": {
             return controlTelevision(
                 args.action as TelevisionAction,
+                context,
             );
         }
 
@@ -345,6 +525,7 @@ async function executeTool(
             return controlHomeDevice(
                 String(args.device ?? ""),
                 args.action as "on" | "off" | "toggle" | "status" | "open" | "close",
+                context,
             );
         }
 
@@ -435,7 +616,7 @@ function normalizeIntent(
         .trim();
 }
 
-type DirectAutomationCommand =
+export type DirectAutomationCommand =
     | {
         name: "control_light";
         args: {
@@ -536,7 +717,9 @@ export function parseDirectAutomationCommand(
     if (/\b(tv|televisao|televisor)\b/.test(text)) {
         let action: TelevisionAction | null = null;
 
-        if (/\b(?:aument(?:a|e|ar)|sub(?:a|ir))\b.*\bvolume\b|\bvolume\b.*\b(?:aument(?:a|e|ar)|sub(?:a|ir))\b/.test(text)) {
+        if (/\b(?:pareia|pareie|parear|emparelha|emparelhe|emparelhar)\b/.test(text)) {
+            action = "pair";
+        } else if (/\b(?:aument(?:a|e|ar)|sub(?:a|ir))\b.*\bvolume\b|\bvolume\b.*\b(?:aument(?:a|e|ar)|sub(?:a|ir))\b/.test(text)) {
             action = "volume_up";
         } else if (/\b(?:diminu(?:a|ir)|abaix(?:a|e|ar))\b.*\bvolume\b|\bvolume\b.*\b(?:diminu(?:a|ir)|abaix(?:a|e|ar))\b/.test(text)) {
             action = "volume_down";
@@ -635,7 +818,10 @@ export function parseDirectAutomationCommand(
         };
     }
 
-    if (/\b(brilho|luminosidade)\b/.test(text)) {
+    if (
+        /\b(brilho|luminosidade)\b/.test(text)
+        || /\b(?:deixa|deixe|coloca|coloque|ajusta|ajuste|muda|mude|diminui|diminua|aumenta|aumente)\b/.test(text)
+    ) {
         const percentage = text.match(/\b(100|[1-9]?\d)\s*%?\b/)?.[1];
 
         if (percentage !== undefined) {
@@ -718,6 +904,7 @@ function formatDirectAutomationResponse(
             unmute: "Som da televisão restaurado, senhor.",
             play: "Reprodução iniciada, senhor.",
             pause: "Reprodução pausada, senhor.",
+            pair: result.message ?? "Confira o PIN exibido na televisão, senhor.",
         };
 
         return responses[command.args.action]
@@ -868,6 +1055,10 @@ export class OllamaService {
         this.history = [];
     }
 
+    abortCurrentResponse(): void {
+        ollama.abort();
+    }
+
     rememberExchange(
         userMessage: string,
         assistantMessage: string,
@@ -878,7 +1069,9 @@ export class OllamaService {
         );
     }
 
-    async chat(input: string): Promise<string> {
+    async chat(input: string, signal?: AbortSignal): Promise<string> {
+        signal?.throwIfAborted();
+        debugLog("[AI]", { model: MODEL, mode: "tools" });
         const directAutomation =
             parseDirectAutomationCommand(input);
 
@@ -886,9 +1079,14 @@ export class OllamaService {
             let finalResponse: string;
 
             try {
-                const rawResult = await executeTool(
-                    directAutomation.name,
-                    directAutomation.args,
+                debugLog(`[TOOL] ${directAutomation.name}`, directAutomation.args);
+                const rawResult = await perf.measure(
+                    `Tool ${directAutomation.name}`,
+                    () => executeTool(
+                        directAutomation.name,
+                        directAutomation.args,
+                        { signal },
+                    ),
                 );
 
                 finalResponse = formatDirectAutomationResponse(
@@ -1128,31 +1326,43 @@ Faça agora obrigatoriamente uma chamada à ferramenta control_light com os argu
             response.message
         );
 
-        const toolResults: string[] = [];
-
-
-        for (const call of toolCalls) {
-            const args =
-                call.function.arguments as Record<
-                    string,
-                    unknown
-                >;
-
-            const result =
-                await executeTool(
-                    call.function.name,
-                    args,
+        const toolResults: string[] = Array.from({ length: toolCalls.length });
+        const chains = new Map<string, Promise<void>>();
+        const executions = toolCalls.map((call, index) => {
+            const args = call.function.arguments as Record<string, unknown>;
+            const serialKey = call.function.name === "control_light"
+                ? "smart-home:light"
+                : call.function.name.startsWith("control_")
+                    ? `smart-home:${call.function.name}:${String(args.device ?? "")}`
+                    : call.function.name.includes("directory")
+                        || call.function.name.includes("file")
+                        || call.function.name === "open_in_editor"
+                        ? "filesystem"
+                        : `independent:${index}`;
+            const execute = async (): Promise<void> => {
+                debugLog(`[TOOL] ${call.function.name}`, args);
+                toolResults[index] = await perf.measure(
+                    `Tool ${call.function.name}`,
+                    () => executeTool(call.function.name, args, { signal }),
                 );
+            };
+            const previous = chains.get(serialKey) ?? Promise.resolve();
+            const current = previous.then(execute);
+            chains.set(serialKey, current);
+            return current;
+        });
 
-            toolResults.push(result);
+        await Promise.all(executions);
 
+        for (const [index, call] of toolCalls.entries()) {
             messages.push({
                 role: "tool",
-                tool_name:
-                    call.function.name,
-                content: result,
+                tool_name: call.function.name,
+                content: toolResults[index],
             });
         }
+
+        debugLog("[AI]", { model: MODEL, tool_calls: toolCalls.length });
 
         const finalToolResponse =
             await ollama.chat({
@@ -1195,7 +1405,10 @@ Faça agora obrigatoriamente uma chamada à ferramenta control_light com os argu
 
     async *chatStream(
         input: string,
+        signal?: AbortSignal,
     ): AsyncGenerator<string> {
+        signal?.throwIfAborted();
+        debugLog("[AI]", { model: MODEL, mode: "stream" });
         const messages: Message[] = [
             {
                 role: "system",
@@ -1236,21 +1449,29 @@ Faça agora obrigatoriamente uma chamada à ferramenta control_light com os argu
                 },
             });
 
+        const abortStream = (): void => stream.abort();
+        signal?.addEventListener("abort", abortStream, { once: true });
+
         let completeResponse = "";
 
-        for await (
-            const part of stream
-        ) {
-            const content =
-                part.message.content ?? "";
+        try {
+            for await (
+                const part of stream
+            ) {
+                signal?.throwIfAborted();
+                const content =
+                    part.message.content ?? "";
 
-            if (!content) {
-                continue;
+                if (!content) {
+                    continue;
+                }
+
+                completeResponse += content;
+
+                yield content;
             }
-
-            completeResponse += content;
-
-            yield content;
+        } finally {
+            signal?.removeEventListener("abort", abortStream);
         }
 
         const finalResponse =
@@ -1258,10 +1479,12 @@ Faça agora obrigatoriamente uma chamada à ferramenta control_light com os argu
                 completeResponse,
             );
 
-        this.rememberTurn(
-            input,
-            finalResponse,
-        );
+        if (!signal?.aborted) {
+            this.rememberTurn(
+                input,
+                finalResponse,
+            );
+        }
     }
 }
 
@@ -1311,6 +1534,10 @@ function shouldUseToolPath(
         return true;
     }
 
+    if (/\b(fecha|feche|fechar|encerra|encerre)\b/.test(text)) {
+        return true;
+    }
+
     /*
      * Limpar terminal
      */
@@ -1321,6 +1548,12 @@ function shouldUseToolPath(
         /\b(terminal|tela)\b/.test(
             text,
         )
+    ) {
+        return true;
+    }
+
+    if (
+        /\b(entra|entre|volta|pasta|diretorio|arquivo|lista|liste|cria|crie|procura|procure|encontra|encontre|explorer|vscode|vs code)\b/.test(text)
     ) {
         return true;
     }

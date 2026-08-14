@@ -1,4 +1,4 @@
-import { OllamaService } from "./ai/ollama.service.ts";
+import { OllamaService, parseDirectAutomationCommand } from "./ai/ollama.service.ts";
 import { TextToSpeechService } from "./speech/text-to-speech.ts";
 import { SpeechToTextService } from "./speech/speech-to-text.ts";
 import { SpeechQueue } from "./speech/speech-queue.ts";
@@ -10,12 +10,15 @@ import {
     startAutomaticDeviceDiscovery,
     stopAutomaticDeviceDiscovery,
 } from "./automation/device-discovery.ts";
+import { FastIntentRouter } from "./intent/fast-intent-router.ts";
+import { stopLightService } from "../tools/light.tool.ts";
 
 
 const tts = new TextToSpeechService();
 const stt = new SpeechToTextService();
 const ai = new OllamaService();
 const hud = new HudServer();
+const fastRouter = new FastIntentRouter(parseDirectAutomationCommand);
 
 
 type AssistantMode =
@@ -23,6 +26,9 @@ type AssistantMode =
     | "sleeping";
 
 let currentTurnInterrupted = false;
+let currentTurnController: AbortController | null = null;
+let interruptionDuringPlayback = false;
+let lastAssistantSpeech = "";
 
 let nextCommandPromise:
     Promise<string> | null = null;
@@ -44,6 +50,7 @@ const speechQueue =
         tts,
         {
             onFirstPlayback() {
+                stt.setPlaybackActive(true);
                 perf.markVoiceStart();
                 hud.update({
                     state: "speaking",
@@ -54,6 +61,9 @@ const speechQueue =
                     "\n[BARGE] Ultron começou a falar; armando STT."
                 );
                 void ensureListening();
+            },
+            onPlaybackEnd() {
+                stt.setPlaybackActive(false);
             },
         },
     );
@@ -78,6 +88,9 @@ stt.onSpeechStart(
         );
 
         currentTurnInterrupted = true;
+        interruptionDuringPlayback = true;
+        currentTurnController?.abort();
+        ai.abortCurrentResponse();
         hud.update({
             state: "listening",
             message: "Interrupção detectada",
@@ -153,10 +166,31 @@ function isWakeCommand(
     );
 }
 
+function isStopCommand(text: string): boolean {
+    return /^(?:ultron[ ,]*)?(?:para|pare|cancela|cancele|esquece isso|esqueça isso)$/i.test(
+        text.trim(),
+    );
+}
+
+function looksLikePlaybackEcho(command: string): boolean {
+    if (!lastAssistantSpeech) return false;
+    const heard = normalizeText(command);
+    const spoken = normalizeText(lastAssistantSpeech);
+
+    if (heard.length < 4 || isStopCommand(command)) return false;
+    if (spoken.includes(heard)) return true;
+
+    const heardTokens = new Set(heard.split(/\s+/).filter(token => token.length > 2));
+    const spokenTokens = new Set(spoken.split(/\s+/).filter(token => token.length > 2));
+    const overlap = [...heardTokens].filter(token => spokenTokens.has(token)).length;
+    return heardTokens.size > 0 && overlap / heardTokens.size >= 0.8;
+}
+
 async function speak(
     text: string,
 ): Promise<void> {
     currentTurnInterrupted = false;
+    lastAssistantSpeech = text;
 
     speechQueue.reset();
 
@@ -165,6 +199,14 @@ async function speak(
     );
 
     await speechQueue.waitUntilIdle();
+}
+
+function shutdownServices(): void {
+    stt.stop();
+    tts.stop();
+    hud.stop();
+    stopAutomaticDeviceDiscovery();
+    stopLightService();
 }
 
 async function main(): Promise<void> {
@@ -210,6 +252,8 @@ async function main(): Promise<void> {
             "STT startup",
         );
 
+        fastRouter.start();
+
         console.log(
             "\nUltron iniciado."
         );
@@ -248,7 +292,24 @@ async function main(): Promise<void> {
                 "STT listen",
             );
 
+            if (
+                interruptionDuringPlayback
+                && looksLikePlaybackEcho(command)
+            ) {
+                interruptionDuringPlayback = false;
+                debugLog("[BARGE] Eco do playback ignorado:", command);
+                hud.update({
+                    state: "listening",
+                    message: "Aguardando comando de voz",
+                });
+                continue;
+            }
+
+            interruptionDuringPlayback = false;
+
             perf.startRequest();
+            currentTurnController = new AbortController();
+            const turnSignal = currentTurnController.signal;
 
 
             try {
@@ -317,6 +378,20 @@ async function main(): Promise<void> {
                     `Me> ${command}`
                 );
 
+                if (isStopCommand(command)) {
+                    const response = "Certo.";
+                    console.log(`Ultron> ${response}`);
+                    ai.rememberExchange(command, response);
+                    await speak(response);
+                    hud.update({
+                        state: "listening",
+                        message: "Aguardando comando de voz",
+                        response,
+                    });
+                    perf.endRequest();
+                    continue;
+                }
+
                 if (
                     isSleepCommand(
                         command
@@ -357,6 +432,25 @@ async function main(): Promise<void> {
                     continue;
                 }
 
+                const fastResult = await fastRouter.execute(
+                    command,
+                    { signal: turnSignal },
+                );
+
+                if (fastResult) {
+                    const response = fastResult.response;
+                    console.log(`Ultron> ${response}`);
+                    ai.rememberExchange(command, response);
+                    await speak(response);
+                    hud.update({
+                        state: "listening",
+                        message: "Aguardando comando de voz",
+                        response,
+                    });
+                    perf.endRequest();
+                    continue;
+                }
+
                 if (
                     ai.usesToolPath(
                         command
@@ -375,7 +469,8 @@ async function main(): Promise<void> {
 
                     const response =
                         await ai.chat(
-                            command
+                            command,
+                            turnSignal,
                         );
 
 
@@ -392,6 +487,7 @@ async function main(): Promise<void> {
                     speechQueue.enqueue(
                         response,
                     );
+                    lastAssistantSpeech = response;
 
                     hud.update({ response });
 
@@ -441,7 +537,8 @@ async function main(): Promise<void> {
                 for await (
                     const token
                     of ai.chatStream(
-                        command
+                        command,
+                        turnSignal,
                     )
                 ) {
                     if (
@@ -468,6 +565,7 @@ async function main(): Promise<void> {
                     );
 
                     streamedResponse += token;
+                    lastAssistantSpeech = streamedResponse;
                     hud.update({ response: streamedResponse });
 
 
@@ -536,18 +634,35 @@ async function main(): Promise<void> {
             } catch (error) {
                 perf.endRequest();
 
+                if (
+                    error instanceof DOMException
+                    && error.name === "AbortError"
+                ) {
+                    hud.update({
+                        state: "listening",
+                        message: "Processando interrupção",
+                    });
+                    continue;
+                }
+
                 throw error;
             }
         }
 
     } finally {
-        stt.stop();
-        tts.stop();
-        hud.stop();
-        stopAutomaticDeviceDiscovery();
+        shutdownServices();
     }
 }
 
+process.once("SIGINT", () => {
+    shutdownServices();
+    process.exit(0);
+});
+
+process.once("SIGTERM", () => {
+    shutdownServices();
+    process.exit(0);
+});
 
 main().catch(
     (error: unknown) => {

@@ -7,6 +7,7 @@ import path from "node:path";
 
 import { runtimeConfig, servicePath } from "../config/runtime.ts";
 import { debugLog } from "../utils/debug.ts";
+import { androidTvRemote, type AndroidTvAction } from "./android-tv-remote.ts";
 
 export type DiscoveredProtocol =
     | "roku"
@@ -657,6 +658,36 @@ function kindFromText(value: string): DiscoveredDeviceKind {
     return "unknown";
 }
 
+export function parseCastDeviceDescription(
+    ip: string,
+    description: string | null,
+    androidRemoteAvailable: boolean,
+): DiscoveredDevice | null {
+    if (
+        !androidRemoteAvailable
+        && (!description || !/dial|google|cast/i.test(description))
+    ) {
+        return null;
+    }
+
+    const name = description ? xmlValue(description, "friendlyName") : undefined;
+    const manufacturer = description ? xmlValue(description, "manufacturer") : undefined;
+    const model = description ? xmlValue(description, "modelName") : undefined;
+    const identity = `${name ?? ""} ${manufacturer ?? ""} ${model ?? ""} ${description ?? ""}`;
+
+    return {
+        id: `${androidRemoteAvailable ? "android-tv" : "google-cast"}:${ip}`,
+        name: name ?? (androidRemoteAvailable ? "Android TV" : `Google Cast ${ip}`),
+        ip,
+        kind: androidRemoteAvailable ? "television" : kindFromText(identity),
+        protocol: androidRemoteAvailable ? "android-tv" : "google-cast",
+        manufacturer,
+        model,
+        location: description ? `http://${ip}:8008/ssdp/device-desc.xml` : undefined,
+        lastSeen: Date.now(),
+    };
+}
+
 async function enrichSsdpRecord(record: SsdpRecord): Promise<DiscoveredDevice> {
     const location = record.headers.location;
     const description = location && /^https?:\/\//i.test(location)
@@ -767,10 +798,14 @@ async function kasaRequest(
 async function probeKnownProtocol(
     ip: string,
 ): Promise<DiscoveredDevice | null> {
-    const [roku, samsung, lg, kasa, http] = await Promise.all([
+    const [roku, samsung, samsungSecure, lg, lgSecure, androidRemote, cast, kasa, http] = await Promise.all([
         isPortOpen(ip, 8060),
         isPortOpen(ip, 8001),
+        isPortOpen(ip, 8002),
         isPortOpen(ip, 3000),
+        isPortOpen(ip, 3001),
+        isPortOpen(ip, 6466),
+        isPortOpen(ip, 8008),
         isPortOpen(ip, 9999),
         isPortOpen(ip, 80),
     ]);
@@ -790,7 +825,7 @@ async function probeKnownProtocol(
         };
     }
 
-    if (samsung) {
+    if (samsung || samsungSecure) {
         const infoText = await fetchText(`http://${ip}:8001/api/v2/`);
         let name = "Samsung TV";
         let model: string | undefined;
@@ -819,7 +854,7 @@ async function probeKnownProtocol(
         };
     }
 
-    if (lg) {
+    if (lg || lgSecure) {
         return {
             id: `lg-webos:${ip}`,
             name: "LG webOS TV",
@@ -829,6 +864,14 @@ async function probeKnownProtocol(
             manufacturer: "LG",
             lastSeen: now,
         };
+    }
+
+    if (androidRemote || cast) {
+        const description = cast
+            ? await fetchText(`http://${ip}:8008/ssdp/device-desc.xml`, 900)
+            : null;
+        const device = parseCastDeviceDescription(ip, description, androidRemote);
+        if (device) return device;
     }
 
     if (kasa) {
@@ -925,7 +968,7 @@ function deviceScore(device: DiscoveredDevice): number {
         roku: 100,
         samsung: 90,
         "lg-webos": 80,
-        "android-tv": 70,
+        "android-tv": 95,
         "tuya-cloud": 85,
         kasa: 75,
         shelly: 75,
@@ -1138,6 +1181,10 @@ export async function discoverDevices(force = false): Promise<DiscoveredDevice[]
 }
 
 async function findDevices(query: string): Promise<DiscoveredDevice[]> {
+    if (process.env.ULTRON_DISABLE_DISCOVERY === "1") {
+        return [];
+    }
+
     let devices = await registry.list();
     const normalizedQuery = normalize(query);
     const matchesDevice = (device: DiscoveredDevice): boolean => {
@@ -1304,6 +1351,7 @@ async function samsungCommand(device: DiscoveredDevice, action: string): Promise
 export async function controlDiscoveredDevice(
     device: DiscoveredDevice,
     action: string,
+    signal?: AbortSignal,
 ): Promise<unknown> {
     if (device.protocol === "roku") {
         return rokuCommand(device, action);
@@ -1311,6 +1359,10 @@ export async function controlDiscoveredDevice(
 
     if (device.protocol === "samsung") {
         return samsungCommand(device, action);
+    }
+
+    if (device.protocol === "android-tv") {
+        return androidTvRemote.control(device, action as AndroidTvAction, signal);
     }
 
     if (device.protocol === "kasa") {

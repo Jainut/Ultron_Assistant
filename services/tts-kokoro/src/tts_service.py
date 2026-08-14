@@ -1,5 +1,7 @@
 import json
+import queue
 import sys
+import threading
 import traceback
 from pathlib import Path
 from voice_engine import (
@@ -13,6 +15,11 @@ def send_message(message: dict) -> None:
         json.dumps(message, ensure_ascii=False),
         flush=True,
     )
+
+
+work_queue: queue.Queue[dict | None] = queue.Queue()
+cancel_events: dict[str, threading.Event] = {}
+cancel_lock = threading.Lock()
 
 
 def process_message(message: dict) -> None:
@@ -30,9 +37,13 @@ def process_message(message: dict) -> None:
     text = str(message["text"])
     output_file = Path(message["output"])
 
+    with cancel_lock:
+        cancel_event = cancel_events[request_id]
+
     generated_file = generate_audio(
         text=text,
         output_file=output_file,
+        should_cancel=cancel_event.is_set,
     )
 
     send_message({
@@ -42,8 +53,76 @@ def process_message(message: dict) -> None:
     })
 
 
+def synthesis_worker() -> None:
+    while True:
+        message = work_queue.get()
+
+        if message is None:
+            return
+
+        request_id = str(message.get("id", ""))
+
+        try:
+            process_message(message)
+
+        except InterruptedError:
+            output = message.get("output")
+
+            if output:
+                Path(str(output)).unlink(missing_ok=True)
+
+            send_message({
+                "id": request_id,
+                "type": "error",
+                "error": "Síntese cancelada.",
+            })
+
+        except Exception as error:
+            traceback.print_exc(file=sys.stderr)
+            send_message({
+                "id": request_id,
+                "type": "error",
+                "error": str(error),
+            })
+
+        finally:
+            with cancel_lock:
+                cancel_events.pop(request_id, None)
+
+
+def enqueue_message(message: dict) -> None:
+    request_id = str(message.get("id", ""))
+    message_type = message.get("type")
+
+    if message_type == "cancel":
+        with cancel_lock:
+            event = cancel_events.get(request_id)
+
+        event and event.set()
+        return
+
+    if message_type != "speak":
+        send_message({
+            "id": request_id,
+            "type": "error",
+            "error": "Tipo de mensagem desconhecido.",
+        })
+        return
+
+    with cancel_lock:
+        cancel_events[request_id] = threading.Event()
+
+    work_queue.put(message)
+
+
 def main() -> None:
     warm_up()
+
+    worker = threading.Thread(
+        target=synthesis_worker,
+        daemon=True,
+    )
+    worker.start()
 
     send_message({
         "type": "ready",
@@ -59,7 +138,7 @@ def main() -> None:
 
         try:
             message = json.loads(line)
-            process_message(message)
+            enqueue_message(message)
 
         except Exception as error:
             traceback.print_exc(
@@ -75,6 +154,8 @@ def main() -> None:
                 "type": "error",
                 "error": str(error),
             })
+
+    work_queue.put(None)
 
 
 if __name__ == "__main__":

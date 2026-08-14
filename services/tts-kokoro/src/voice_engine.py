@@ -1,5 +1,6 @@
 from pathlib import Path
 from time import perf_counter
+from collections.abc import Callable
 import os
 import sys
 
@@ -112,7 +113,12 @@ def save_audio(
 def generate_audio(
     text: str,
     output_file: Path,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> Path:
+    cancelled = should_cancel or (lambda: False)
+    if cancelled():
+        raise InterruptedError("Síntese cancelada.")
+
     total_started_at = perf_counter()
 
     generator_started_at = perf_counter()
@@ -133,6 +139,9 @@ def generate_audio(
     kokoro_started_at = perf_counter()
 
     for _, _, audio in generator:
+        if cancelled():
+            raise InterruptedError("Síntese cancelada.")
+
         audio_array = (
             audio.cpu().numpy()
             if hasattr(audio, "cpu")
@@ -160,6 +169,9 @@ def generate_audio(
             "um trecho de áudio"
         )
 
+    if cancelled():
+        raise InterruptedError("Síntese cancelada.")
+
     concat_started_at = perf_counter()
 
     complete_audio = np.concatenate(
@@ -175,6 +187,9 @@ def generate_audio(
         complete_audio
     )
 
+    if cancelled():
+        raise InterruptedError("Síntese cancelada.")
+
     output_file.parent.mkdir(
         parents=True,
         exist_ok=True,
@@ -184,6 +199,10 @@ def generate_audio(
         processed_audio,
         output_file,
     )
+
+    if cancelled():
+        output_file.unlink(missing_ok=True)
+        raise InterruptedError("Síntese cancelada.")
 
     log(
         f"TOTAL: "
