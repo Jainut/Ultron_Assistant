@@ -1,298 +1,575 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { createInterface } from "node:readline";
+import {
+    spawn,
+    type ChildProcessByStdio,
+    type ChildProcessWithoutNullStreams,
+} from "node:child_process";
+import type { Readable } from "node:stream";
+import { readFile, unlink } from "node:fs/promises";
 import path from "node:path";
+import { runtimeConfig, servicePath } from "../config/runtime.ts";
+import { debugLog, serviceError } from "../utils/debug.ts";
 
-type SttMessage = | { type: "ready"; } | { type: "wake_detected"; text?: string } | { type: "transcript"; text: string; } | { type: "timeout"; } | { type: "error"; error: string; }
 
-interface PendingListen {
-    resolve: (text: string) => void;
-    reject: (error: Error) => void;
+interface CaptureMessage {
+    type:
+    | "ready"
+    | "speech_start"
+    | "audio"
+    | "error";
+
+    path?: string;
+    error?: string;
 }
 
-export class SpeechToTextService {
-    private child: ChildProcessWithoutNullStreams | null = null;
-    private ready = false;
 
-    private pendingListen: PendingListen | null = null;
+export class SpeechToTextService {
+    private readonly speechStartListeners =
+        new Set<() => void>();
+    private whisperProcess: ChildProcessByStdio<null, Readable, Readable> | null = null;
+    private captureProcess: ChildProcessWithoutNullStreams | null = null;
+
+    private captureReady = false;
+
+    private pendingResolve: ((text: string) => void) | null = null;
+    private pendingReject: ((error: Error) => void) | null = null;
+
+
+    private readonly whisperPort = runtimeConfig.whisperPort;
+
+    private readonly whisperUrl =
+        `http://127.0.0.1:${this.whisperPort}/inference`;
+
+
+    onSpeechStart(
+        listener: () => void,
+    ): () => void {
+        this.speechStartListeners.add(
+            listener,
+        );
+
+        return () => {
+            this.speechStartListeners.delete(
+                listener,
+            );
+        };
+    }
 
     async start(): Promise<void> {
-        if (this.child) {
-            return;
-        }
+        const whisperDir = servicePath("speech-whisper");
 
-        const ultronRoot = path.resolve(process.cwd(), "..", "..");
-        const pythonExecutable = path.join(ultronRoot, "services", "speech-vosk", ".venv", "Scripts", "python.exe");
-        const serviceScript = path.join(ultronRoot, "services", "speech-vosk", "src", "stt_service.py");
+        const whisperExe = path.join(
+            whisperDir,
+            "build",
+            "bin",
+            "whisper-server.exe",
+        );
+
+        const modelPath = path.join(
+            whisperDir,
+            runtimeConfig.whisperModel,
+        );
+
+        const captureDir = servicePath("speech-input");
+
+        const pythonExe = path.join(
+            captureDir,
+            ".venv",
+            "Scripts",
+            "python.exe",
+        );
+
+        const captureScript = path.join(
+            captureDir,
+            "src",
+            "capture_service.py",
+        );
 
 
-        return new Promise<void>((resolve, reject) => {
-            let startFinished = false;
+        const whisperProcess = spawn(
+            whisperExe,
+            [
+                "-m",
+                modelPath,
 
-            const child = spawn(
-                pythonExecutable,
+                "--host",
+                "127.0.0.1",
+
+                "--port",
+                String(this.whisperPort),
+
+                "-l",
+                "pt",
+
+                "-t",
+                    String(runtimeConfig.whisperThreads),
+
+                "-fa",
+
+                "-nt",
+
+                "--prompt",
                 [
-                    "-u",
-                    serviceScript
+                    "Ultron",
+                    "Ollama",
+                    "Kokoro",
+                    "TypeScript",
+                    "JavaScript",
+                    "Visual Studio Code",
+                    "VS Code",
+                    "Zen Browser",
+                    "PowerShell",
+                ].join(", "),
+            ],
+            {
+                cwd: whisperDir,
+                windowsHide: true,
+                stdio: [
+                    "ignore",
+                    "pipe",
+                    "pipe",
                 ],
-                {
-                    stdio: [
-                        "pipe",
-                        "pipe",
-                        "pipe",
+            },
+        );
 
-                    ],
+        this.whisperProcess = whisperProcess;
 
-                    env: {
-                        ...process.env,
 
-                        PYTHONIOENCODING: "utf-8",
-                        PYTHONUTF8: "1",
-                        PYTHONUNBUFFERED: "1"
-                    }
+        whisperProcess.on(
+            "exit",
+            (code) => {
+                if (code !== 0) {
+                    console.error(
+                        `[Whisper] servidor encerrado com código ${code}`
+                    );
                 }
-            );
+            },
+        );
 
-            this.child = child;
 
-            const output = createInterface({
-                input: child.stdout,
-            });
+        await this.waitForWhisper();
 
-            output.on("line", (line) => {
-                const trimmedLine = line.trim();
 
-                if (!trimmedLine) {
-                    return;
-                }
+        this.captureProcess = spawn(
+            pythonExe,
+            [
+                "-u",
+                captureScript,
+            ],
+            {
+                cwd: captureDir,
 
-                let message: SttMessage;
+                env: {
+                    ...process.env,
 
-                try {
-                    message = JSON.parse(trimmedLine) as SttMessage;
-                } catch {
-                    console.warn(`[STT] Saída não JSON ${trimmedLine}`);
-                    return;
-                }
+                    PYTHONIOENCODING: "utf-8",
+                    PYTHONUTF8: "1",
+                    PYTHONUNBUFFERED: "1",
+                },
 
-                if (message.type === "ready" && !startFinished) {
-                    startFinished = true;
-                    this.ready = true;
+                windowsHide: true,
+                stdio: [
+                    "pipe",
+                    "pipe",
+                    "pipe",
+                ],
+            },
+        );
 
-                    console.log("Sitema de reconhecimento de voz carregado");
 
-                    resolve();
-
-                    return;
-                }
-
-                this.handleMessage(message);
-            });
-
-            child.stderr.on("data", (data: Buffer) => {
-                const text = data.toString("utf8").trim();
+        this.captureProcess.stderr.on(
+            "data",
+            (data) => {
+                const text = data
+                    .toString()
+                    .trim();
 
                 if (text) {
-                    console.log(`[STT] ${text}`);
+                    serviceError("[STT]", text);
                 }
-            });
-
-            child.once("error", (error) => {
-                this.ready = false;
-
-                if (!startFinished) {
-                    startFinished = true;
-                    reject(error);
-                }
-
-                this.rejectPending(error);
-            });
-
-            child.once("close", (code) => {
-                this.ready = false;
-                this.child = null;
-
-                const error = new Error(`Serviço STT encerrado com código ${code ?? "desconhecido"}`);
-
-                if (!startFinished) {
-                    startFinished = true;
-                    reject(error);
-                }
-
-                this.rejectPending(error);
-            });
-        });
-    }
-
-    listen(): Promise<string> {
-        if (!this.child || !this.ready) {
-            return Promise.reject(new Error("O serviço de reconhecimento de voz não foi iniciado"));
-        }
-
-        if (this.pendingListen) {
-            return Promise.reject(new Error("Já existe uma operação de escuta em andamento"));
-        }
-
-        return new Promise<string>((resolve, reject) => {
-            this.pendingListen = {
-                resolve,
-                reject
-            };
-
-            try {
-                this.send({
-                    type: "resume"
-                });
-            } catch (error) {
-                this.pendingListen = null;
-
-                reject(error instanceof Error ? error : new Error(String(error)));
-            }
-        });
-    }
-
-    pause(): void {
-        if (!this.child || !this.ready) {
-            return;
-        }
-
-        this.send({
-            type: "pause"
-        });
-    }
-
-    resume(): void {
-        if (!this.child || !this.ready) {
-            return;
-        }
-
-        this.send({
-            type: "resume"
-        });
-    }
-
-    stop(): void {
-        const child = this.child;
-
-        this.ready = false;
-        this.child = null;
-
-        if (!child) {
-            return;
-        }
-
-        try {
-            if (child.stdin.writable) {
-                child.stdin.write(
-                    `${JSON.stringify({
-                        type: "stop",
-                    })}\n`,
-                );
-            }
-        } catch {
-
-        }
-
-        setTimeout(() => {
-            if (!child.killed) {
-                child.kill();
-            }
-        }, 300).unref();
-
-        this.rejectPending(
-            new Error(
-                "Serviço de reconhecimento de voz encerrado.",
-            ),
+            },
         );
+
+
+        let buffer = "";
+
+        this.captureProcess.stdout.on(
+            "data",
+            (data) => {
+                buffer += data.toString();
+
+                const lines = buffer.split(
+                    "\n"
+                );
+
+                buffer = lines.pop() ?? "";
+
+                for (const line of lines) {
+                    const trimmed = line.trim();
+
+                    if (!trimmed) {
+                        continue;
+                    }
+
+                    try {
+                        const message =
+                            JSON.parse(
+                                trimmed
+                            ) as CaptureMessage;
+
+                        void this.handleCaptureMessage(
+                            message
+                        );
+
+                    } catch {
+                        // Ignora saída não JSON.
+                    }
+                }
+            },
+        );
+
+
+        await this.waitForCapture();
     }
 
 
-    private send(
-        message: Record<string, unknown>,
-    ): void {
-        if (
-            !this.child
-            || !this.child.stdin.writable
-        ) {
-            throw new Error(
-                "Não foi possível enviar uma mensagem ao serviço STT.",
+    private async waitForWhisper(): Promise<void> {
+        const deadline =
+            Date.now() + 60_000;
+
+        while (Date.now() < deadline) {
+            try {
+                const response = await fetch(
+                    `http://127.0.0.1:${this.whisperPort}/`
+                );
+
+                if (response.ok) {
+                    return;
+                }
+
+            } catch {
+                // Ainda carregando o modelo.
+            }
+
+            await new Promise(
+                (resolve) =>
+                    setTimeout(
+                        resolve,
+                        250,
+                    )
             );
         }
 
-        this.child.stdin.write(
-            `${JSON.stringify(message)}\n`,
+        throw new Error(
+            "Whisper Server não iniciou dentro do tempo esperado."
         );
     }
 
 
-    private handleMessage(
-        message: SttMessage,
-    ): void {
-        switch (message.type) {
-            case "wake_detected": {
-                console.log(
-                    "\nUltron detectando comandos..."
-                );
+    private async waitForCapture(): Promise<void> {
+        const deadline =
+            Date.now() + 10_000;
 
-                break;
+        while (Date.now() < deadline) {
+            if (this.captureReady) {
+                return;
             }
 
+            await new Promise(
+                (resolve) =>
+                    setTimeout(
+                        resolve,
+                        50,
+                    )
+            );
+        }
 
-            case "transcript": {
-                const text = message.text.trim();
+        throw new Error(
+            "Serviço de captura de áudio não iniciou."
+        );
+    }
 
-                if (!this.pendingListen) {
-                    console.warn(
-                        `[STT] Transcript recebido sem listener: ${text}`,
+
+    private async handleCaptureMessage(
+        message: CaptureMessage,
+    ): Promise<void> {
+        if (
+            message.type ===
+            "ready"
+        ) {
+            this.captureReady =
+                true;
+
+            return;
+        }
+
+        if (
+            message.type ===
+            "speech_start"
+        ) {
+            debugLog(
+                "[BARGE] speech_start recebido do Python."
+            );
+
+            for (
+                const listener
+                of this.speechStartListeners
+            ) {
+                listener();
+            }
+
+            return;
+        }
+
+        if (
+            message.type ===
+            "error"
+        ) {
+            const error =
+                new Error(
+                    message.error
+                    ?? "Erro desconhecido na captura."
+                );
+
+            this.pendingReject?.(
+                error
+            );
+
+            this.clearPending();
+
+            return;
+        }
+
+        if (
+            message.type ===
+            "audio"
+            && message.path
+        ) {
+            try {
+                const text =
+                    await this.transcribe(
+                        message.path
                     );
+
+
+                if (!text) {
+                    this.sendCapture({
+                        type: "resume",
+                    });
 
                     return;
                 }
 
-                const pending =
-                    this.pendingListen;
 
-                this.pendingListen = null;
-
-                pending.resolve(text);
-
-                break;
-            }
-
-
-            case "timeout": {
-                this.rejectPending(
-                    new Error(
-                        "Tempo para falar o comando esgotado.",
-                    ),
+                this.pendingResolve?.(
+                    text
                 );
 
-                break;
-            }
+                this.clearPending();
+
+            } catch (error) {
+                const normalizedError =
+                    error instanceof Error
+                        ? error
+                        : new Error(
+                            String(error)
+                        );
 
 
-            case "error": {
-                this.rejectPending(
-                    new Error(message.error),
+                this.pendingReject?.(
+                    normalizedError
                 );
 
-                break;
+
+                this.clearPending();
             }
         }
     }
 
 
-    private rejectPending(
-        error: Error,
+    private async transcribe(
+        audioPath: string
+    ): Promise<string> {
+        try {
+            const audio = await readFile(
+                audioPath
+            );
+
+            const form = new FormData();
+
+            form.append(
+                "file",
+                new Blob(
+                    [audio],
+                    {
+                        type: "audio/wav",
+                    },
+                ),
+                path.basename(
+                    audioPath
+                ),
+            );
+
+            form.append(
+                "language",
+                "pt"
+            );
+
+            form.append(
+                "temperature",
+                "0.0"
+            );
+
+            form.append(
+                "response_format",
+                "text"
+            );
+
+            form.append(
+                "no_timestamps",
+                "true"
+            );
+
+            form.append(
+                "suppress_non_speech",
+                "true"
+            );
+
+            form.append(
+                "prompt",
+                [
+                    "Ultron",
+                    "Ollama",
+                    "Kokoro",
+                    "TypeScript",
+                    "JavaScript",
+                    "Visual Studio Code",
+                    "VS Code",
+                    "Zen Browser",
+                    "PowerShell",
+                ].join(", "),
+            );
+
+
+            const response = await fetch(
+                this.whisperUrl,
+                {
+                    method: "POST",
+                    body: form,
+                },
+            );
+
+
+            if (!response.ok) {
+                const body =
+                    await response.text();
+
+                throw new Error(
+                    `Whisper respondeu ${response.status}: ${body}`
+                );
+            }
+
+
+            const text =
+                await response.text();
+
+            return text.trim();
+
+        } finally {
+            await unlink(
+                audioPath
+            ).catch(
+                () => undefined
+            );
+        }
+    }
+
+
+    listen(): Promise<string> {
+        if (!this.captureProcess) {
+            return Promise.reject(
+                new Error(
+                    "Serviço STT não iniciado."
+                )
+            );
+        }
+
+
+        if (this.pendingResolve) {
+            return Promise.reject(
+                new Error(
+                    "Já existe uma escuta STT pendente."
+                )
+            );
+        }
+
+
+        return new Promise<string>(
+            (resolve, reject) => {
+                this.pendingResolve =
+                    resolve;
+
+                this.pendingReject =
+                    reject;
+
+                this.sendCapture({
+                    type: "resume",
+                });
+            },
+        );
+    }
+
+
+    pause(): void {
+        this.sendCapture({
+            type: "pause",
+        });
+    }
+
+
+    resume(): void {
+        this.sendCapture({
+            type: "resume",
+        });
+    }
+
+
+    private sendCapture(
+        message: object
     ): void {
-        if (!this.pendingListen) {
+        if (
+            !this.captureProcess
+            || this.captureProcess.killed
+        ) {
             return;
         }
 
-        const pending =
-            this.pendingListen;
+        this.captureProcess.stdin.write(
+            JSON.stringify(
+                message
+            ) + "\n"
+        );
+    }
 
-        this.pendingListen = null;
 
-        pending.reject(error);
+    private clearPending(): void {
+        this.pendingResolve = null;
+        this.pendingReject = null;
+    }
+
+
+    stop(): void {
+        this.sendCapture({
+            type: "stop",
+        });
+
+        this.captureProcess?.kill();
+        this.whisperProcess?.kill();
+
+        this.captureProcess = null;
+        this.whisperProcess = null;
+
+        this.captureReady = false;
+
+        this.clearPending();
     }
 }

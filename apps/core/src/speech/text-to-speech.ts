@@ -5,6 +5,8 @@ import {
 import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
 import path from "node:path";
+import { servicePath } from "../config/runtime.ts";
+import { serviceError } from "../utils/debug.ts";
 
 interface PendingRequest {
     resolve: (audioPath: string) => void;
@@ -19,13 +21,7 @@ interface ServiceMessage {
     error?: string;
 }
 
-const ultronRoot = path.resolve(process.cwd(), "..", "..");
-
-const ttsRoot = path.join(
-    ultronRoot,
-    "services",
-    "tts-kokoro",
-);
+const ttsRoot = servicePath("tts-kokoro");
 
 const pythonExecutable = path.join(
     ttsRoot,
@@ -61,6 +57,8 @@ export class TextToSpeechService {
         }
 
         return new Promise((resolve, reject) => {
+            let startupSettled = false;
+
             this.child = spawn(
                 pythonExecutable,
                 [
@@ -87,14 +85,18 @@ export class TextToSpeechService {
             });
 
             lines.on("line", (line) => {
-                this.handleMessage(line, resolve);
+                this.handleMessage(line, () => {
+                    startupSettled = true;
+                    resolve();
+                });
             });
 
             this.child.stderr.on("data", (chunk: Buffer) => {
-                console.error(`[Kokoro] ${chunk.toString().trim()}`);
+                serviceError("[Kokoro]", chunk.toString());
             });
 
             this.child.once("error", (error) => {
+                startupSettled = true;
                 reject(error);
             });
 
@@ -105,6 +107,11 @@ export class TextToSpeechService {
                 const error = new Error(
                     `O serviço Kokoro encerrou com código ${code}.`,
                 );
+
+                if (!startupSettled) {
+                    startupSettled = true;
+                    reject(error);
+                }
 
                 for (const request of this.pending.values()) {
                     request.reject(error);
@@ -129,7 +136,6 @@ export class TextToSpeechService {
 
         if (message.type === "ready") {
             this.ready = true;
-            console.log("Serviço de voz carregado.");
             resolveStart();
             return;
         }

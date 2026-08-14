@@ -1,0 +1,19 @@
+{
+  "television": {
+    "mac": "AA:BB:CC:DD:EE:FF",
+    "broadcast": "192.168.1.255",
+    "wolPort": 9
+  },
+  "homeAssistant": {
+    "url": "http://homeassistant.local:8123",
+    "token": "COLE_AQUI_UM_LONG_LIVED_ACCESS_TOKEN",
+    "entities": {
+      "television": "media_player.sala",
+      "ventilador": "fan.ventilador_sala",
+      "tomada": "switch.tomada_escritorio",
+      "ar condicionado": "climate.ar_condicionado",
+      "portão": "cover.portao_garagem",
+      "cortina": "cover.cortina_sala"
+    }
+  }
+}

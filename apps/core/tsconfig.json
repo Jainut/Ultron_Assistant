@@ -7,7 +7,10 @@
         "esModuleInterop": true,
         "allowSyntheticDefaultImports": true,
         "allowImportingTsExtensions": true,
-        "noEmit": true,
+        "rewriteRelativeImportExtensions": true,
+        "rootDir": ".",
+        "outDir": "dist",
+        "sourceMap": true,
         "skipLibCheck": true,
         "types": [
             "node"
@@ -16,6 +19,12 @@
     "include": [
         "src/**/*.ts",
         "tools/**/*.ts",
-        "config/**/*.ts"
+        "config/**/*.ts",
+        "shared/**/*.ts",
+        "tests/**/*.ts"
+    ],
+    "exclude": [
+        "dist",
+        "node_modules"
     ]
 }

@@ -1,18 +1,22 @@
 {
   "name": "ultron",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Assistente pessoal local com voz, IA e automação residencial",
+  "main": "apps/core/dist/src/index.js",
+  "bin": {
+    "ultron": "bin/ultron.cjs"
+  },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "dev": "tsx watch src/index.ts",
-    "build": "tsc",
-    "start": "node dist/index.js"
+    "dev": "npm --prefix apps/core run dev",
+    "build": "npm --prefix apps/core run build",
+    "start": "npm --prefix apps/core run start",
+    "check": "npm --prefix apps/core run check",
+    "test": "npm --prefix apps/core run test"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "type": "commonjs",
+  "type": "module",
   "devDependencies": {
     "@types/node": "^26.1.2",
     "tsx": "^4.23.8",

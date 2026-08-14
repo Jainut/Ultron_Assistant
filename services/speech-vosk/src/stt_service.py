@@ -10,7 +10,7 @@ import sounddevice as sd
 from vosk import KaldiRecognizer, Model, SetLogLevel
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
-MODEL_PATH = (ROOT_DIR/"models"/"vosk-model-small-pt-0.3")
+MODEL_PATH = (ROOT_DIR/"models"/"vosk-model-ptbr")
 INPUT_DEVICE = 17
 SAMPLE_RATE = 48000
 BLOCK_SIZE = int(SAMPLE_RATE * 0.25)

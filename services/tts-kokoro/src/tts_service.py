@@ -2,8 +2,10 @@ import json
 import sys
 import traceback
 from pathlib import Path
-
-from voice_engine import generate_audio
+from voice_engine import (
+    generate_audio,
+    warm_up,
+)
 
 
 def send_message(message: dict) -> None:
@@ -41,6 +43,8 @@ def process_message(message: dict) -> None:
 
 
 def main() -> None:
+    warm_up()
+
     send_message({
         "type": "ready",
     })
@@ -58,10 +62,16 @@ def main() -> None:
             process_message(message)
 
         except Exception as error:
-            traceback.print_exc(file=sys.stderr)
+            traceback.print_exc(
+                file=sys.stderr
+            )
 
             send_message({
-                "id": message.get("id") if message else None,
+                "id": (
+                    message.get("id")
+                    if message
+                    else None
+                ),
                 "type": "error",
                 "error": str(error),
             })
