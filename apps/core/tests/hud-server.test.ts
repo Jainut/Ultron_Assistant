@@ -18,3 +18,40 @@ test("procura outra porta quando a porta preferida está ocupada", async () => {
         primary.stop();
     }
 });
+
+test("publicar timings preserva o estado corrente do HUD", async () => {
+    const hud = new HudServer(18_797);
+
+    try {
+        await hud.start();
+        hud.update({
+            state: "thinking",
+            message: "Interpretando solicitação",
+            transcript: "liga a luz",
+        });
+        hud.update({
+            timings: {
+                endpoint_delay: 300,
+                speech_duration: 1_000,
+            },
+        });
+
+        const response = await fetch(`${hud.url()}/api/status`);
+        const snapshot = await response.json() as {
+            state: string;
+            message: string;
+            transcript?: string;
+            timings?: Record<string, number>;
+        };
+
+        assert.equal(snapshot.state, "thinking");
+        assert.equal(snapshot.message, "Interpretando solicitação");
+        assert.equal(snapshot.transcript, "liga a luz");
+        assert.deepEqual(snapshot.timings, {
+            endpoint_delay: 300,
+            speech_duration: 1_000,
+        });
+    } finally {
+        hud.stop();
+    }
+});

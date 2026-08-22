@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import { OllamaService, parseDirectAutomationCommand } from "./ai/ollama.service.ts";
 import { TextToSpeechService } from "./speech/text-to-speech.ts";
 import { SpeechToTextService } from "./speech/speech-to-text.ts";
@@ -12,6 +14,21 @@ import {
 } from "./automation/device-discovery.ts";
 import { FastIntentRouter } from "./intent/fast-intent-router.ts";
 import { stopLightService } from "../tools/light.tool.ts";
+import {
+    registerToolActions,
+    startAutomationRuntime,
+    stopAutomationRuntime,
+} from "./automation-engine/runtime.ts";
+import {
+    requestPerformanceTimelines,
+    type RequestTimelineSnapshot,
+} from "./utils/request-performance-timeline.ts";
+import {
+    deliverNotification,
+    notificationCenter,
+    type NotificationRecord,
+    type NotificationTrust,
+} from "./notifications/index.ts";
 
 
 const tts = new TextToSpeechService();
@@ -19,6 +36,8 @@ const stt = new SpeechToTextService();
 const ai = new OllamaService();
 const hud = new HudServer();
 const fastRouter = new FastIntentRouter(parseDirectAutomationCommand);
+const lifecycleController = new AbortController();
+const conversationId = randomUUID();
 
 
 type AssistantMode =
@@ -32,8 +51,60 @@ let lastAssistantSpeech = "";
 
 let nextCommandPromise:
     Promise<string> | null = null;
+let nextCommandRequestId: string | null = null;
+let currentRequestId: string | null = null;
+let nextNotificationPromise: Promise<NotificationRecord> | null = null;
+let notificationDeliveryDisabled = false;
+const attemptedNotificationIds = new Set<string>();
+let activeNotificationTrust: NotificationTrust | null = null;
+let interruptedUntrustedNotification = false;
+let activeNotificationDeliveryFailed = false;
+
+function ensureNotificationWait(): Promise<NotificationRecord> {
+    if (notificationDeliveryDisabled) {
+        return new Promise<NotificationRecord>(() => undefined);
+    }
+    if (!nextNotificationPromise) {
+        nextNotificationPromise = notificationCenter.waitForNext({
+            signal: lifecycleController.signal,
+            excludeIds: [...attemptedNotificationIds],
+        });
+    }
+    return nextNotificationPromise;
+}
+
+function listeningTimeline() {
+    return nextCommandRequestId
+        ? requestPerformanceTimelines.get(nextCommandRequestId)
+        : undefined;
+}
+
+function finishRequestTimeline(requestId: string | null): RequestTimelineSnapshot | undefined {
+    if (!requestId) return undefined;
+    const snapshot = requestPerformanceTimelines.finish(requestId);
+    if (snapshot) {
+        const timings = Object.fromEntries(
+            snapshot.metrics.map(metric => [metric.name, Math.round(metric.valueMs)]),
+        );
+        debugLog("[PERF][REQUEST]", {
+            ...snapshot.correlation,
+            metrics: timings,
+        });
+        if (snapshot.metrics.length > 0) {
+            // Publica apenas telemetria; o merge do HUD preserva state/message.
+            hud.update({ timings });
+        }
+    }
+    return snapshot;
+}
+
 function ensureListening(): Promise<string> {
     if (!nextCommandPromise) {
+        nextCommandRequestId = randomUUID();
+        requestPerformanceTimelines.start({
+            requestId: nextCommandRequestId,
+            conversationId,
+        });
         debugLog(
             "[BARGE] STT armado."
         );
@@ -49,7 +120,15 @@ const speechQueue =
     new SpeechQueue(
         tts,
         {
+            onSynthesisStart() {
+                if (currentRequestId) {
+                    requestPerformanceTimelines.get(currentRequestId)?.mark("tts_start");
+                }
+            },
             onFirstPlayback() {
+                if (currentRequestId) {
+                    requestPerformanceTimelines.get(currentRequestId)?.mark("audio_start");
+                }
                 stt.setPlaybackActive(true);
                 perf.markVoiceStart();
                 hud.update({
@@ -64,12 +143,33 @@ const speechQueue =
             },
             onPlaybackEnd() {
                 stt.setPlaybackActive(false);
+                if (currentRequestId) {
+                    requestPerformanceTimelines.get(currentRequestId)?.mark("audio_end");
+                    finishRequestTimeline(currentRequestId);
+                }
+            },
+            onPlaybackChunkStart(reference) {
+                stt.startPlaybackReference(reference);
+            },
+            onPlaybackChunkEnd(reference) {
+                stt.endPlaybackReference(reference);
+            },
+            onSynthesisError() {
+                if (activeNotificationTrust !== null) {
+                    activeNotificationDeliveryFailed = true;
+                }
+            },
+            onPlaybackError() {
+                if (activeNotificationTrust !== null) {
+                    activeNotificationDeliveryFailed = true;
+                }
             },
         },
     );
 
 stt.onSpeechStart(
     () => {
+        listeningTimeline()?.mark("speech_start", { overwrite: true });
         debugLog(
             "[BARGE] callback speech_start."
         );
@@ -87,6 +187,12 @@ stt.onSpeechStart(
             "[VOICE] Interrupção detectada."
         );
 
+        if (activeNotificationTrust === "untrusted-derived") {
+            // A primeira transcrição pode ser eco do próprio aviso externo.
+            // Ela só interrompe a fala; nunca pode virar uma ação/tool.
+            interruptedUntrustedNotification = true;
+        }
+
         currentTurnInterrupted = true;
         interruptionDuringPlayback = true;
         currentTurnController?.abort();
@@ -98,6 +204,33 @@ stt.onSpeechStart(
         void speechQueue.interrupt();
     },
 );
+
+stt.onSpeechEnd(metrics => {
+    const timeline = listeningTimeline();
+    if (!timeline) return;
+
+    if (!metrics) {
+        // Compatibilidade com mensagens de captura legadas sem telemetria.
+        timeline.mark("speech_end", { overwrite: true });
+        return;
+    }
+
+    const endpointDetected = timeline.mark("endpoint_detected", {
+        overwrite: true,
+    });
+    timeline.mark("speech_end", {
+        atMs: endpointDetected.atMs - metrics.endpointDelayMs,
+        overwrite: true,
+    });
+});
+
+stt.onTranscriptionStart(() => {
+    listeningTimeline()?.mark("transcription_start", { overwrite: true });
+});
+
+stt.onTranscriptionEnd(() => {
+    listeningTimeline()?.mark("transcription_end", { overwrite: true });
+});
 
 function normalizeText(
     text: string,
@@ -201,12 +334,37 @@ async function speak(
     await speechQueue.waitUntilIdle();
 }
 
-function shutdownServices(): void {
-    stt.stop();
-    tts.stop();
-    hud.stop();
-    stopAutomaticDeviceDiscovery();
-    stopLightService();
+let shutdownPromise: Promise<void> | null = null;
+
+function shutdownServices(): Promise<void> {
+    if (shutdownPromise) return shutdownPromise;
+
+    shutdownPromise = (async () => {
+        lifecycleController.abort(new DOMException("Ultron encerrado", "AbortError"));
+
+        const stops: Array<() => void> = [
+            () => stt.stop(),
+            () => tts.stop(),
+            () => hud.stop(),
+            () => stopAutomaticDeviceDiscovery(),
+            () => stopLightService(),
+        ];
+        for (const stop of stops) {
+            try {
+                stop();
+            } catch (error) {
+                debugLog("[SHUTDOWN] Falha ao encerrar serviço:", error);
+            }
+        }
+
+        try {
+            await stopAutomationRuntime();
+        } catch (error) {
+            debugLog("[SHUTDOWN] Falha ao persistir Automation Core:", error);
+        }
+    })();
+
+    return shutdownPromise;
 }
 
 async function main(): Promise<void> {
@@ -218,7 +376,6 @@ async function main(): Promise<void> {
         await hud.start();
         console.log(`Interface: ${hud.url()}`);
         hud.openInBrowser();
-        startAutomaticDeviceDiscovery();
 
         debugLog(
             "Carregando sistema de voz..."
@@ -252,11 +409,20 @@ async function main(): Promise<void> {
             "STT startup",
         );
 
+        // Registra as tools determinísticas antes de aceitar o primeiro comando.
+        // O carregamento dos jobs persistidos continua em background.
+        registerToolActions();
         fastRouter.start();
 
         console.log(
             "\nUltron iniciado."
         );
+
+        // Serviços de fundo só entram depois do caminho crítico de voz/tools.
+        startAutomaticDeviceDiscovery();
+        void startAutomationRuntime(lifecycleController.signal).catch(error => {
+            debugLog("[AUTOMATION] Serviço degradado:", error);
+        });
 
 
         hud.update({
@@ -273,13 +439,106 @@ async function main(): Promise<void> {
             );
             const commandPromise =
                 nextCommandPromise
-                ?? stt.listen();
+                ?? ensureListening();
+            const requestId = nextCommandRequestId ?? randomUUID();
 
+
+            let inputEvent:
+                | { kind: "command"; command: string }
+                | { kind: "notification"; notification: NotificationRecord }
+                | { kind: "notification-error"; error: unknown };
+            try {
+                inputEvent = await Promise.race([
+                    commandPromise.then(command => ({ kind: "command" as const, command })),
+                    ensureNotificationWait().then(
+                        notification => ({ kind: "notification" as const, notification }),
+                        error => ({ kind: "notification-error" as const, error }),
+                    ),
+                ]);
+            } catch (error) {
+                finishRequestTimeline(requestId);
+                nextCommandPromise = null;
+                nextCommandRequestId = null;
+                throw error;
+            }
+
+            if (inputEvent.kind === "notification-error") {
+                nextNotificationPromise = null;
+                notificationDeliveryDisabled = true;
+                perf.end("STT listen");
+                debugLog("[NOTIFICATION] Entrega em voz degradada:", inputEvent.error);
+                continue;
+            }
+
+            if (inputEvent.kind === "notification") {
+                nextNotificationPromise = null;
+                attemptedNotificationIds.add(inputEvent.notification.id);
+                perf.end("STT listen");
+                const { notification } = inputEvent;
+                console.log(
+                    notification.trust === "system"
+                        ? `[NOTIFICATION] ${notification.title}: ${notification.message}`
+                        : "[NOTIFICATION] Novo aviso externo.",
+                );
+                debugLog("[NOTIFICATION]", {
+                    id: notification.id,
+                    source: notification.source,
+                    priority: notification.priority,
+                    trust: notification.trust,
+                });
+                hud.update({
+                    state: assistantMode === "sleeping" ? "sleeping" : "speaking",
+                    message: notification.title,
+                    response: notification.message,
+                });
+
+                try {
+                    const outcome = await deliverNotification(notification, {
+                        speak: assistantMode === "active"
+                            ? async message => {
+                                activeNotificationTrust = notification.trust;
+                                activeNotificationDeliveryFailed = false;
+                                try {
+                                    await speak(message);
+                                    if (activeNotificationDeliveryFailed) {
+                                        throw new Error("A fila de voz não concluiu a notificação.");
+                                    }
+                                } finally {
+                                    activeNotificationTrust = null;
+                                    activeNotificationDeliveryFailed = false;
+                                }
+                            }
+                            : undefined,
+                        wasInterrupted: () => currentTurnInterrupted,
+                        markDelivered: id => notificationCenter.markDelivered(id),
+                        signal: lifecycleController.signal,
+                    });
+                    if (outcome.status === "delivered") {
+                        attemptedNotificationIds.delete(notification.id);
+                    } else {
+                        debugLog("[NOTIFICATION] Entrega interrompida; aviso mantido pendente.", {
+                            id: notification.id,
+                        });
+                    }
+                } catch (error) {
+                    // O ID fica excluído somente nesta execução e será tentado
+                    // novamente após restart, sem derrubar STT/TTS.
+                    activeNotificationTrust = null;
+                    debugLog("[NOTIFICATION] Falha na entrega ou confirmação:", error);
+                }
+                hud.update({
+                    state: assistantMode === "sleeping" ? "sleeping" : "listening",
+                    message: assistantMode === "sleeping"
+                        ? "Em espera"
+                        : "Aguardando comando de voz",
+                });
+                continue;
+            }
+
+            const command = inputEvent.command;
             nextCommandPromise = null;
-
-
-            const command =
-                await commandPromise;
+            nextCommandRequestId = null;
+            currentRequestId = requestId;
 
             hud.update({
                 state: "thinking",
@@ -294,18 +553,37 @@ async function main(): Promise<void> {
 
             if (
                 interruptionDuringPlayback
+                && interruptedUntrustedNotification
+            ) {
+                interruptionDuringPlayback = false;
+                interruptedUntrustedNotification = false;
+                debugLog("[BARGE] Transcrição durante aviso externo descartada por segurança.");
+                hud.update({
+                    state: "listening",
+                    message: "Aviso interrompido; repita o comando",
+                });
+                finishRequestTimeline(requestId);
+                if (currentRequestId === requestId) currentRequestId = null;
+                continue;
+            }
+
+            if (
+                interruptionDuringPlayback
                 && looksLikePlaybackEcho(command)
             ) {
                 interruptionDuringPlayback = false;
-                debugLog("[BARGE] Eco do playback ignorado:", command);
+                debugLog("[BARGE] Eco do playback ignorado.");
                 hud.update({
                     state: "listening",
                     message: "Aguardando comando de voz",
                 });
+                finishRequestTimeline(requestId);
+                if (currentRequestId === requestId) currentRequestId = null;
                 continue;
             }
 
             interruptionDuringPlayback = false;
+            interruptedUntrustedNotification = false;
 
             perf.startRequest();
             currentTurnController = new AbortController();
@@ -378,6 +656,30 @@ async function main(): Promise<void> {
                     `Me> ${command}`
                 );
 
+                if (
+                    isStopCommand(command)
+                    && fastRouter.hasPendingConfirmation(conversationId)
+                ) {
+                    const cancellation = await fastRouter.execute(command, {
+                        signal: turnSignal,
+                        requestId,
+                        conversationId,
+                    });
+                    if (cancellation) {
+                        const response = cancellation.response;
+                        console.log(`Ultron> ${response}`);
+                        ai.rememberExchange(command, response);
+                        await speak(response);
+                        hud.update({
+                            state: "listening",
+                            message: "Aguardando comando de voz",
+                            response,
+                        });
+                        perf.endRequest();
+                        continue;
+                    }
+                }
+
                 if (isStopCommand(command)) {
                     const response = "Certo.";
                     console.log(`Ultron> ${response}`);
@@ -434,13 +736,29 @@ async function main(): Promise<void> {
 
                 const fastResult = await fastRouter.execute(
                     command,
-                    { signal: turnSignal },
+                    {
+                        signal: turnSignal,
+                        requestId,
+                        conversationId,
+                    },
                 );
 
                 if (fastResult) {
-                    const response = fastResult.response;
+                    const response = fastResult.needsInterpretation
+                        ? await ai.interpretToolResults(
+                            command,
+                            fastResult.actions.map((action, index) => ({
+                                name: action.name,
+                                input: action.input,
+                                result: fastResult.results[index],
+                            })),
+                            turnSignal,
+                        )
+                        : fastResult.response;
                     console.log(`Ultron> ${response}`);
-                    ai.rememberExchange(command, response);
+                    if (!fastResult.needsInterpretation) {
+                        ai.rememberExchange(command, response);
+                    }
                     await speak(response);
                     hud.update({
                         state: "listening",
@@ -471,6 +789,7 @@ async function main(): Promise<void> {
                         await ai.chat(
                             command,
                             turnSignal,
+                            { requestId, conversationId },
                         );
 
 
@@ -646,22 +965,26 @@ async function main(): Promise<void> {
                 }
 
                 throw error;
+            } finally {
+                finishRequestTimeline(requestId);
+                if (currentRequestId === requestId) currentRequestId = null;
+                if (currentTurnController?.signal === turnSignal) {
+                    currentTurnController = null;
+                }
             }
         }
 
     } finally {
-        shutdownServices();
+        await shutdownServices();
     }
 }
 
 process.once("SIGINT", () => {
-    shutdownServices();
-    process.exit(0);
+    void shutdownServices().finally(() => process.exit(0));
 });
 
 process.once("SIGTERM", () => {
-    shutdownServices();
-    process.exit(0);
+    void shutdownServices().finally(() => process.exit(0));
 });
 
 main().catch(

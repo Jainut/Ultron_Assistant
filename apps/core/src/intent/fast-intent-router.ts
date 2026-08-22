@@ -1,26 +1,29 @@
 import type { ToolResult } from "../../shared/types.ts";
-import { clearTerminal } from "../../tools/clear-terminal.tool.ts";
-import { getTime } from "../../tools/clock.tool.ts";
-import {
-    controlHomeDevice,
-    controlTelevision,
-    submitTelevisionPairingCode,
-} from "../../tools/home-automation.tool.ts";
-import { controlLight, type LightAction } from "../../tools/light.tool.ts";
-import { closeApp, openApp } from "../../tools/open-app.tool.ts";
-import { filesystemTools } from "../../tools/filesystem/filesystem.tools.ts";
 import type { DirectAutomationCommand } from "../ai/ollama.service.ts";
 import { fileSystem } from "../filesystem/file-system-service.ts";
+import { operationalContext } from "../context/operational-context.ts";
 import { applicationResolver } from "../system/application-resolver.ts";
 import type { ToolContext } from "../tools/tool.ts";
-import { ToolRegistry } from "../tools/tool-registry.ts";
+import { ultronToolRegistry } from "../tools/core-tool-registry.ts";
 import { debugLog } from "../utils/debug.ts";
 import { perf } from "../utils/performance.ts";
+import { requestPerformanceTimelines } from "../utils/request-performance-timeline.ts";
+import { parsePersonalIntent } from "./personal-intent-parser.ts";
+import { redactForLog } from "../utils/redaction.ts";
+import { formatToolExecutionResponses } from "../tools/tool-response-formatting.ts";
 
 type FastAction = {
     name: string;
     input: Record<string, unknown>;
-    category: "system" | "filesystem" | "smart-home" | "information";
+    category:
+        | "system"
+        | "filesystem"
+        | "smart-home"
+        | "information"
+        | "mail"
+        | "tasks"
+        | "calendar"
+        | "automation";
     serialKey?: string;
     confidence: number;
 };
@@ -28,6 +31,7 @@ type FastAction = {
 export interface FastIntentResult {
     handled: true;
     response: string;
+    needsInterpretation: boolean;
     results: ToolResult[];
     actions: ReadonlyArray<Pick<FastAction, "name" | "input" | "confidence">>;
 }
@@ -45,7 +49,7 @@ function normalize(value: string): string {
 
 function splitCommands(input: string): string[] {
     return input
-        .split(/\s+(?:e|depois)\s+(?=(?:abre|abra|abrir|inicia|inicie|liga|ligue|acende|acenda|apaga|apague|desliga|desligue|deixa|coloca|ajusta|muda|entra|vai|volta|lista|cria|procura|encontra)\b)/i)
+        .split(/\s+(?:e|depois)\s+(?=(?:abre|abra|abrir|inicia|inicie|liga|ligue|acende|acenda|apaga|apague|desliga|desligue|deixa|coloca|ajusta|muda|entra|vai|volta|lista|liste|cria|crie|procura|procure|encontra|encontre|leia|ler|resuma|resume|marca|marque|conclui|conclua|conecta|conecte)\b)/i)
         .map(part => part.trim())
         .filter(Boolean);
 }
@@ -72,128 +76,71 @@ export function extractTelevisionPairingCode(input: string): string | null {
     return spoken.length === 6 ? spoken : null;
 }
 
-function automationResult(command: DirectAutomationCommand, raw: string): ToolResult {
-    let parsed: {
-        success?: boolean;
-        message?: string;
-        error?: string;
-        fallback_error?: string;
-        state?: { is_on?: boolean; pairingRequired?: boolean };
-    } = {};
-
-    try {
-        parsed = JSON.parse(raw) as typeof parsed;
-    } catch {
-        return { success: true, message: raw, speech: raw };
-    }
-
-    if (parsed.success === false) {
-        const message = parsed.message ?? parsed.fallback_error ?? parsed.error ?? "Não foi possível executar o comando.";
-        return { success: false, message, speech: message };
-    }
-
-    if (command.name === "control_light") {
-        const messages: Partial<Record<LightAction, string>> = {
-            on: "Lâmpada acesa.",
-            off: "Lâmpada apagada.",
-            color: "Cor ajustada.",
-            brightness: "Brilho ajustado.",
-            white: "Temperatura ajustada.",
-        };
-        const speech = command.args.action === "status"
-            ? parsed.state?.is_on === true ? "A lâmpada está acesa." : parsed.state?.is_on === false ? "A lâmpada está apagada." : "Estado consultado."
-            : messages[command.args.action] ?? "Feito.";
-        return { success: true, message: raw, speech, data: parsed };
-    }
-
-    if (command.name === "control_tv") {
-        const messages: Partial<Record<string, string>> = {
-            on: "Televisão ligada.", off: "Televisão desligada.", volume_up: "Volume aumentado.",
-            volume_down: "Volume diminuído.", mute: "Televisão silenciada.", unmute: "Som restaurado.",
-            play: "Reprodução iniciada.", pause: "Reprodução pausada.",
-        };
-        return {
-            success: true,
-            message: raw,
-            speech: parsed.state?.pairingRequired
-                ? parsed.message
-                : messages[command.args.action] ?? parsed.message ?? "Feito.",
-            data: parsed,
-        };
-    }
-
-    return { success: true, message: parsed.message ?? raw, speech: "Feito.", data: parsed };
-}
-
 export class FastIntentRouter {
-    private readonly registry = new ToolRegistry();
+    private readonly registry = ultronToolRegistry;
     private lastDevice: "light" | "television" | string | null = null;
     private lightState = { brightness: 50, temperature: 50, power: undefined as boolean | undefined };
 
-    constructor(private readonly parseAutomation: AutomationParser) {
-        for (const tool of filesystemTools) this.registry.register(tool);
-        this.registry
-            .register<Record<string, never>, ToolResult>({
-                name: "get_current_time", description: "Consulta a hora local.", category: "information",
-                execute: async () => getTime(),
-            })
-            .register<Record<string, never>, ToolResult>({
-                name: "clear_terminal", description: "Limpa o terminal.", category: "system",
-                execute: async () => clearTerminal(),
-            })
-            .register<{ application: string }, ToolResult>({
-                name: "open_application", description: "Localiza e abre um aplicativo.", category: "system",
-                execute: (input, context) => openApp(input.application, context),
-            })
-            .register<{ application: string }, ToolResult>({
-                name: "close_application", description: "Fecha um aplicativo localizado com segurança.", category: "system",
-                execute: (input, context) => closeApp(input.application, context),
-            })
-            .register<DirectAutomationCommand, ToolResult>({
-                name: "automation", description: "Executa automação residencial determinística.", category: "smart-home",
-                execute: async (command, context) => {
-                    context?.signal?.throwIfAborted();
-                    const raw = command.name === "control_light"
-                        ? await controlLight(command.args, context)
-                        : command.name === "control_tv"
-                            ? await controlTelevision(command.args.action, context)
-                            : await controlHomeDevice(command.args.device, command.args.action, context);
-                    return automationResult(command, raw);
-                },
-            })
-            .register<{ code: string }, ToolResult>({
-                name: "pair_television",
-                description: "Envia o PIN exibido pela Android TV para concluir o pareamento.",
-                category: "smart-home",
-                execute: async (input, context) => {
-                    const raw = await submitTelevisionPairingCode(input.code, context);
-                    let parsed: { success?: boolean; message?: string; state?: unknown } = {};
-
-                    try {
-                        parsed = JSON.parse(raw) as typeof parsed;
-                    } catch {
-                        return { success: false, message: raw, speech: raw };
-                    }
-
-                    const message = parsed.message ?? "NÃ£o consegui concluir o pareamento da TV.";
-                    return {
-                        success: parsed.success === true,
-                        message,
-                        speech: message,
-                        data: parsed.state,
-                    };
-                },
-            });
-    }
+    constructor(private readonly parseAutomation: AutomationParser) {}
 
     start(): void {
         applicationResolver.start();
         fileSystem.startIndexing();
     }
 
+    hasPendingConfirmation(conversationId: string): boolean {
+        return this.registry.pendingConfirmation(conversationId) !== null;
+    }
+
+    /** Planejamento puro o suficiente para diagnóstico/testes; não executa tools. */
+    planActions(input: string): ReadonlyArray<Pick<FastAction,
+        "name" | "input" | "category" | "confidence" | "serialKey"
+    >> {
+        return this.plan(input).map(action => ({ ...action }));
+    }
+
     async execute(input: string, context: ToolContext = {}): Promise<FastIntentResult | null> {
         const intentStartedAt = performance.now();
-        const actions = this.plan(input);
+        const timeline = context.requestId
+            ? requestPerformanceTimelines.get(context.requestId)
+            : undefined;
+        timeline?.mark("intent_start");
+        const confirmationDecision = context.conversationId
+            ? this.confirmationDecision(input, context.conversationId)
+            : null;
+        if (confirmationDecision) {
+            timeline?.mark("intent_end");
+            perf.record("Intent detection", performance.now() - intentStartedAt);
+            const execution = confirmationDecision === "approve"
+                ? await this.registry.approvePendingConfirmation(
+                    context.conversationId!,
+                    context,
+                )
+                : this.registry.cancelPendingConfirmation(context.conversationId!);
+            if (!execution) return null;
+            const remaining = execution.remainingConfirmations ?? 0;
+            const response = [
+                this.registry.formatResponse(execution.name, execution.result),
+                remaining === 1
+                    ? "Ainda há uma ação aguardando sua confirmação."
+                    : remaining > 1
+                        ? `Ainda há ${remaining} ações aguardando sua confirmação.`
+                        : "",
+            ].filter(Boolean).join(" ");
+            return {
+                handled: true,
+                response,
+                needsInterpretation: false,
+                results: [execution.result],
+                actions: [{ name: execution.name, input: {}, confidence: 1 }],
+            };
+        }
+        let actions: FastAction[];
+        try {
+            actions = this.plan(input);
+        } finally {
+            timeline?.mark("intent_end");
+        }
         perf.record("Intent detection", performance.now() - intentStartedAt);
 
         if (actions.length === 0) return null;
@@ -201,7 +148,9 @@ export class FastIntentRouter {
         debugLog("[INTENT]", actions.map(action => ({
             type: action.name,
             confidence: action.confidence,
-            target: action.input,
+            target: redactForLog(action.input),
+            requestId: context.requestId,
+            conversationId: context.conversationId,
         })));
         perf.record("Tool selection", performance.now() - intentStartedAt);
         const chains = new Map<string, Promise<void>>();
@@ -209,11 +158,21 @@ export class FastIntentRouter {
         const executions = actions.map((action, index) => {
             const execute = async (): Promise<void> => {
                 context.signal?.throwIfAborted();
-                debugLog(`[TOOL] ${action.name}`, action.input);
+                debugLog(`[TOOL] ${action.name}`, {
+                    input: redactForLog(action.input),
+                    requestId: context.requestId,
+                    conversationId: context.conversationId,
+                    toolCallId: context.toolCallId
+                        ?? (context.requestId ? `${context.requestId}:${index + 1}` : undefined),
+                });
                 try {
                     results[index] = await perf.measure(
                         `Tool ${action.name}`,
-                        () => this.registry.execute<ToolResult>(action.name, action.input, context),
+                        () => this.registry.execute(action.name, action.input, {
+                            ...context,
+                            toolCallId: context.toolCallId
+                                ?? (context.requestId ? `${context.requestId}:${index + 1}` : undefined),
+                        }),
                     );
                 } catch (error) {
                     if (context.signal?.aborted) throw error;
@@ -225,7 +184,8 @@ export class FastIntentRouter {
                 }
                 this.remember(action, results[index]);
             };
-            const key = action.serialKey;
+            const key = action.serialKey
+                ?? this.registry.serializationKey(action.name, action.input);
 
             if (!key) return execute();
             const previous = chains.get(key) ?? Promise.resolve();
@@ -236,18 +196,39 @@ export class FastIntentRouter {
 
         await Promise.all(executions);
         const failures = results.filter(result => !result.success);
-        const response = failures.length > 0
-            ? failures.map(result => result.speech ?? result.message).join(" ")
-            : results.length > 1
-                ? "Feito."
-                : results[0].speech ?? results[0].message;
+        const needsInterpretation = failures.length === 0 && actions.some(action => (
+            this.registry.get(action.name)?.responsePolicy?.deterministic !== true
+        ));
+        const response = formatToolExecutionResponses(
+            this.registry,
+            actions.map((action, index) => ({
+                name: action.name,
+                result: results[index],
+            })),
+        );
 
         return {
             handled: true,
             response,
+            needsInterpretation,
             results,
             actions: actions.map(({ name, input: actionInput, confidence }) => ({ name, input: actionInput, confidence })),
         };
+    }
+
+    private confirmationDecision(
+        input: string,
+        conversationId: string,
+    ): "approve" | "cancel" | null {
+        if (!this.hasPendingConfirmation(conversationId)) return null;
+        const text = normalize(input);
+        if (/^(?:sim|confirmo|confirmado|pode|pode fazer|pode enviar|prossegue|continue|faz isso)$/.test(text)) {
+            return "approve";
+        }
+        if (/^(?:nao|para|pare|cancela|cancelar|deixa pra la|esquece|esquece isso|nao faca|melhor nao)$/.test(text)) {
+            return "cancel";
+        }
+        return null;
     }
 
     private plan(input: string): FastAction[] {
@@ -282,8 +263,28 @@ export class FastIntentRouter {
                     : automation.name === "control_tv"
                         ? "home:television"
                         : `home:${normalize(automation.args.device)}`;
-                actions.push({ name: "automation", input: automation as unknown as Record<string, unknown>, category: "smart-home", serialKey, confidence: 0.98 });
+                actions.push({
+                    name: automation.name,
+                    input: automation.args as unknown as Record<string, unknown>,
+                    category: "smart-home",
+                    serialKey,
+                    confidence: 0.98,
+                });
                 plannedDevice = automation.name === "control_light" ? "light" : automation.name === "control_tv" ? "television" : automation.args.device;
+                continue;
+            }
+
+            const personal = parsePersonalIntent(part, {
+                operationalContext: operationalContext.snapshot(),
+            });
+            if (personal) {
+                actions.push({
+                    name: personal.name,
+                    input: personal.input,
+                    category: personal.category,
+                    serialKey: personal.serialKey,
+                    confidence: personal.confidence,
+                });
                 continue;
             }
 
@@ -407,19 +408,56 @@ export class FastIntentRouter {
     }
 
     private remember(action: FastAction, result: ToolResult): void {
-        if (!result.success || action.name !== "automation") return;
-        const command = action.input as unknown as DirectAutomationCommand;
+        if (!result.success) return;
+
+        const resultData = result.data as { path?: string; application?: string } | undefined;
+
+        if (action.name === "open_application") {
+            const application = resultData?.application
+                ?? String(action.input.application ?? "");
+            operationalContext.set({
+                type: "application",
+                id: application,
+                label: application,
+            });
+            return;
+        }
+
+        if (action.category === "filesystem" && resultData?.path) {
+            operationalContext.set({
+                type: action.name === "open_project" ? "project" : "file",
+                id: resultData.path,
+                label: resultData.path,
+                metadata: { tool: action.name },
+            });
+            return;
+        }
+
+        if (!["control_light", "control_tv", "control_home_device"].includes(action.name)) {
+            return;
+        }
+        const command = {
+            name: action.name,
+            args: action.input,
+        } as DirectAutomationCommand;
 
         if (command.name === "control_light") {
             this.lastDevice = "light";
+            operationalContext.set({ type: "device", id: "light", label: "lâmpada" });
             if (command.args.action === "on") this.lightState.power = true;
             if (command.args.action === "off") this.lightState.power = false;
             if (command.args.brightness !== undefined) this.lightState.brightness = command.args.brightness;
             if (command.args.temperature !== undefined) this.lightState.temperature = command.args.temperature;
         } else if (command.name === "control_tv") {
             this.lastDevice = "television";
+            operationalContext.set({ type: "device", id: "television", label: "televisão" });
         } else {
             this.lastDevice = command.args.device;
+            operationalContext.set({
+                type: "device",
+                id: command.args.device,
+                label: command.args.device,
+            });
         }
     }
 }

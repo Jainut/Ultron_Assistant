@@ -1180,6 +1180,26 @@ export async function discoverDevices(force = false): Promise<DiscoveredDevice[]
     return registry.scan(force);
 }
 
+export async function isDiscoveredDeviceOnline(
+    device: DiscoveredDevice,
+    timeoutMs = 350,
+): Promise<boolean> {
+    const ports: Partial<Record<DiscoveredProtocol, number[]>> = {
+        roku: [8060],
+        samsung: [8001, 8002],
+        "lg-webos": [3000, 3001],
+        "android-tv": [6466],
+        "google-cast": [8008],
+        kasa: [9999],
+        shelly: [80],
+        wled: [80],
+    };
+    const candidates = ports[device.protocol] ?? [];
+    return (await Promise.all(
+        candidates.map(port => isPortOpen(device.ip, port, timeoutMs)),
+    )).some(Boolean);
+}
+
 async function findDevices(query: string): Promise<DiscoveredDevice[]> {
     if (process.env.ULTRON_DISABLE_DISCOVERY === "1") {
         return [];
@@ -1246,6 +1266,18 @@ async function rokuCommand(device: DiscoveredDevice, action: string): Promise<un
         unmute: "VolumeMute",
         play: "Play",
         pause: "Play",
+        stop: "Stop",
+        home: "Home",
+        back: "Back",
+        up: "Up",
+        down: "Down",
+        left: "Left",
+        right: "Right",
+        select: "Select",
+        channel_up: "ChannelUp",
+        channel_down: "ChannelDown",
+        next: "Fwd",
+        previous: "Rev",
     };
     const key = keys[action];
 
@@ -1276,6 +1308,20 @@ async function samsungCommand(device: DiscoveredDevice, action: string): Promise
         unmute: "KEY_MUTE",
         play: "KEY_PLAY",
         pause: "KEY_PAUSE",
+        stop: "KEY_STOP",
+        home: "KEY_HOME",
+        back: "KEY_RETURN",
+        up: "KEY_UP",
+        down: "KEY_DOWN",
+        left: "KEY_LEFT",
+        right: "KEY_RIGHT",
+        select: "KEY_ENTER",
+        menu: "KEY_MENU",
+        input: "KEY_SOURCE",
+        channel_up: "KEY_CHUP",
+        channel_down: "KEY_CHDOWN",
+        next: "KEY_FF",
+        previous: "KEY_REWIND",
     };
     const key = keys[action];
 

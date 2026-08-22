@@ -7,6 +7,7 @@ import {
     controlDiscoveredDevice,
     findDiscoveredDevice,
     findDiscoveredTelevision,
+    isDiscoveredDeviceOnline,
 } from "../src/automation/device-discovery.ts";
 import { androidTvRemote } from "../src/automation/android-tv-remote.ts";
 import type { ToolContext } from "../src/tools/tool.ts";
@@ -20,6 +21,20 @@ export type TelevisionAction =
     | "unmute"
     | "play"
     | "pause"
+    | "stop"
+    | "home"
+    | "back"
+    | "up"
+    | "down"
+    | "left"
+    | "right"
+    | "select"
+    | "menu"
+    | "input"
+    | "channel_up"
+    | "channel_down"
+    | "next"
+    | "previous"
     | "pair";
 
 interface HomeAssistantConfig {
@@ -199,27 +214,13 @@ export async function controlTelevision(
             });
         }
 
-        if (action === "on" && config.television?.mac) {
-            await wakeOnLan(
-                config.television.mac,
-                config.television.broadcast,
-                config.television.wolPort,
-            );
-            return asResult({
-                success: true,
-                device: "television",
-                action,
-                message: "Sinal Wake-on-LAN enviado para a TV.",
-            });
-        }
-
         const discovered = await findDiscoveredTelevision();
         context.signal?.throwIfAborted();
 
         if (discovered) {
             if (action === "pair") {
                 if (discovered.protocol !== "android-tv") {
-                    throw new Error(`${discovered.name} nÃ£o usa o pareamento Android TV.`);
+                    throw new Error(`${discovered.name} não usa o pareamento Android TV.`);
                 }
 
                 const state = await androidTvRemote.beginPairing(discovered, context.signal);
@@ -235,16 +236,72 @@ export async function controlTelevision(
                 });
             }
 
-            if (action === "on" && discovered.mac) {
-                await wakeOnLan(
-                    discovered.mac,
-                    discovered.broadcast,
-                );
+            if (action === "on") {
+                const online = await isDiscoveredDeviceOnline(discovered);
+
+                if (online && discovered.protocol === "android-tv") {
+                    const status = await controlDiscoveredDevice(
+                        discovered,
+                        "status",
+                        context.signal,
+                    ) as { powered?: boolean };
+
+                    if (status.powered === true) {
+                        return asResult({
+                            success: true,
+                            device: discovered.name,
+                            action,
+                            state: { ...status, confirmed: true },
+                            message: `${discovered.name} já está ligada e confirmou o estado.`,
+                        });
+                    }
+
+                    if (status.powered === false) {
+                        const state = await controlDiscoveredDevice(
+                            discovered,
+                            "on",
+                            context.signal,
+                        );
+                        return asResult({
+                            success: true,
+                            device: discovered.name,
+                            action,
+                            state: { state, confirmed: false },
+                            message: "Enviei o comando para ligar, mas a TV ainda não confirmou que ligou.",
+                        });
+                    }
+
+                    return asResult({
+                        success: false,
+                        device: discovered.name,
+                        action,
+                        state: status,
+                        message: "A TV está acessível, mas não confirmou o estado. Não enviei Power para evitar desligá-la por engano.",
+                    });
+                }
+
+                const mac = discovered.mac ?? config.television?.mac;
+
+                if (mac) {
+                    await wakeOnLan(
+                        mac,
+                        discovered.broadcast ?? config.television?.broadcast,
+                        config.television?.wolPort,
+                    );
+                    return asResult({
+                        success: false,
+                        device: discovered.name,
+                        action,
+                        state: { wakeOnLanSent: true, confirmed: false },
+                        message: "Enviei Wake-on-LAN, mas essa TV não confirmou que ligou.",
+                    });
+                }
+
                 return asResult({
-                    success: true,
+                    success: false,
                     device: discovered.name,
                     action,
-                    message: `TV ${discovered.name} encontrada automaticamente e acionada por Wake-on-LAN.`,
+                    message: "Essa TV não oferece um método disponível para ligá-la pela rede.",
                 });
             }
 
@@ -255,6 +312,21 @@ export async function controlTelevision(
                 action,
                 state,
                 message: `Comando ${action} enviado para ${discovered.name}, encontrada automaticamente.`,
+            });
+        }
+
+        if (action === "on" && config.television?.mac) {
+            await wakeOnLan(
+                config.television.mac,
+                config.television.broadcast,
+                config.television.wolPort,
+            );
+            return asResult({
+                success: false,
+                device: "television",
+                action,
+                state: { wakeOnLanSent: true, confirmed: false },
+                message: "Enviei Wake-on-LAN, mas não consegui confirmar que a TV ligou.",
             });
         }
 
@@ -286,11 +358,11 @@ export async function submitTelevisionPairingCode(
             off: "TV pareada e desligada.",
             toggle: "TV pareada e acionada.",
             volume_up: "TV pareada e volume aumentado.",
-            volume_down: "TV pareada e volume diminuÃ­do.",
+            volume_down: "TV pareada e volume diminuído.",
             mute: "TV pareada e silenciada.",
             unmute: "TV pareada e som restaurado.",
-            play: "TV pareada e reproduÃ§Ã£o iniciada.",
-            pause: "TV pareada e reproduÃ§Ã£o pausada.",
+            play: "TV pareada e reprodução iniciada.",
+            pause: "TV pareada e reprodução pausada.",
         };
         return asResult({
             success: true,

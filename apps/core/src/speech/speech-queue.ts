@@ -10,22 +10,38 @@ import {
 } from "./audio_player.ts";
 import { performance } from "node:perf_hooks";
 import { perf } from "../utils/performance.ts";
+import { debugLog } from "../utils/debug.ts";
+import type { PlaybackReference } from "./playback-reference.ts";
 
 
-interface SpeechQueueOptions {
+export interface SpeechQueueOptions {
+    onSynthesisStart?: () => void;
     onFirstPlayback?: () => void;
     onPlaybackEnd?: () => void;
+    /** Executado somente quando o player confirma que o WAV começou. */
+    onPlaybackChunkStart?: (reference: PlaybackReference) => void;
+    /** Executado no terminal do player, antes de o WAV ser removido. */
+    onPlaybackChunkEnd?: (reference: PlaybackReference) => void;
+    /** Observabilidade sem alterar o contrato tolerante a falhas da fila. */
+    onSynthesisError?: () => void;
+    onPlaybackError?: () => void;
+}
+
+interface QueuedAudio {
+    readonly path: string;
+    readonly generation: number;
 }
 
 
 export class SpeechQueue {
     private readonly textQueue: string[] = [];
-    private readonly audioQueue: string[] = [];
+    private readonly audioQueue: QueuedAudio[] = [];
 
     private synthesizing = false;
     private playing = false;
 
     private firstPlaybackStarted = false;
+    private firstSynthesisStarted = false;
 
     /*
      * Cada interrupt() incrementa esse número.
@@ -70,6 +86,7 @@ export class SpeechQueue {
     reset(): void {
         this.firstPlaybackStarted =
             false;
+        this.firstSynthesisStarted = false;
     }
 
 
@@ -111,7 +128,12 @@ export class SpeechQueue {
         /*
          * Para imediatamente o áudio atual.
          */
-        stopAudio();
+        if (typeof this.tts.stopPlayback === "function") {
+            this.tts.stopPlayback();
+        } else {
+            // Compatibilidade com doubles antigos e implementações legadas.
+            stopAudio();
+        }
 
         /*
          * Remove os arquivos que não
@@ -119,9 +141,9 @@ export class SpeechQueue {
          */
         await Promise.all(
             queuedAudio.map(
-                audioPath =>
+                audio =>
                     unlink(
-                        audioPath,
+                        audio.path,
                     ).catch(
                         () => undefined,
                     ),
@@ -175,6 +197,10 @@ export class SpeechQueue {
                     this.generation;
 
                 try {
+                    if (!this.firstSynthesisStarted) {
+                        this.firstSynthesisStarted = true;
+                        this.options.onSynthesisStart?.();
+                    }
                     const synthesisController = new AbortController();
                     this.activeSynthesisController = synthesisController;
                     const synthesisStartedAt = performance.now();
@@ -209,9 +235,10 @@ export class SpeechQueue {
                         continue;
                     }
 
-                    this.audioQueue.push(
-                        audioPath,
-                    );
+                    this.audioQueue.push({
+                        path: audioPath,
+                        generation: requestGeneration,
+                    });
 
                     /*
                      * Não aguardamos.
@@ -229,6 +256,8 @@ export class SpeechQueue {
                     ) {
                         continue;
                     }
+
+                    this.options.onSynthesisError?.();
 
                     console.error(
                         "[SpeechQueue] " +
@@ -273,35 +302,71 @@ export class SpeechQueue {
             while (
                 this.audioQueue.length > 0
             ) {
-                const audioPath =
+                const audio =
                     this.audioQueue.shift();
 
-                if (!audioPath) {
+                if (!audio) {
                     continue;
                 }
 
-                if (
-                    !this.firstPlaybackStarted
-                ) {
-                    this.firstPlaybackStarted =
-                        true;
-
-                    this.options
-                        .onFirstPlayback?.();
-                    this.speakingAnnounced = true;
-                }
+                const audioPath = audio.path;
+                let playbackReference: PlaybackReference | null = null;
 
                 try {
                     const playbackStartedAt = performance.now();
-                    await playAudio(
-                        audioPath,
-                    );
+                    const announcePlayback = (): void => {
+                        if (playbackReference) return;
+
+                        /*
+                         * Um playback_started pode chegar depois de um
+                         * interrupt/flush. Não deixa essa geração antiga
+                         * substituir a referência acústica da nova fala.
+                         */
+                        if (audio.generation !== this.generation) {
+                            this.tts.stopPlayback?.();
+                            return;
+                        }
+
+                        playbackReference = {
+                            path: audioPath,
+                            generation: audio.generation,
+                            startedAtUnixMs: Date.now(),
+                        };
+
+                        if (!this.firstPlaybackStarted) {
+                            this.firstPlaybackStarted = true;
+                            this.options.onFirstPlayback?.();
+                            this.speakingAnnounced = true;
+                        }
+
+                        try {
+                            this.options.onPlaybackChunkStart?.(
+                                playbackReference,
+                            );
+                        } catch (error) {
+                            // Observabilidade/AEC não pode derrubar a voz.
+                            debugLog(
+                                "[SpeechQueue] Callback de início de chunk falhou:",
+                                error,
+                            );
+                        }
+                    };
+                    if (typeof this.tts.play === "function") {
+                        await this.tts.play(audioPath, {
+                            onStarted: announcePlayback,
+                        });
+                    } else {
+                        // Compatibilidade com serviços/doubles pré-playback-v1.
+                        announcePlayback();
+                        await playAudio(audioPath);
+                    }
                     perf.record(
                         "Audio playback",
                         performance.now() - playbackStartedAt,
                     );
 
                 } catch (error) {
+                    this.options.onPlaybackError?.();
                     console.error(
                         "[SpeechQueue] " +
                         "Erro no playback:",
@@ -309,6 +374,20 @@ export class SpeechQueue {
                     );
 
                 } finally {
+                    if (playbackReference) {
+                        try {
+                            this.options.onPlaybackChunkEnd?.(
+                                playbackReference,
+                            );
+                        } catch (error) {
+                            // O WAV ainda deve ser liberado mesmo se o listener falhar.
+                            debugLog(
+                                "[SpeechQueue] Callback de fim de chunk falhou:",
+                                error,
+                            );
+                        }
+                    }
+
                     /*
                      * Arquivo usado ou
                      * interrompido:

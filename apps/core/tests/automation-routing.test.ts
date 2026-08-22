@@ -81,6 +81,25 @@ test("prepara automações simples localmente sem depender do Ollama", () => {
     );
 });
 
+test("interpreta navegação e mídia da Android TV pelo caminho rápido", () => {
+    assert.deepEqual(
+        parseDirectAutomationCommand("Abra a tela inicial da TV."),
+        { name: "control_tv", args: { action: "home" } },
+    );
+    assert.deepEqual(
+        parseDirectAutomationCommand("Vai para a direita na TV."),
+        { name: "control_tv", args: { action: "right" } },
+    );
+    assert.deepEqual(
+        parseDirectAutomationCommand("Confirma com OK na TV."),
+        { name: "control_tv", args: { action: "select" } },
+    );
+    assert.deepEqual(
+        parseDirectAutomationCommand("Aumenta o canal da TV."),
+        { name: "control_tv", args: { action: "channel_up" } },
+    );
+});
+
 test("interpreta ajuste percentual da luz sem exigir a palavra brilho", () => {
     assert.deepEqual(
         parseDirectAutomationCommand("Diminui a luz para 20%."),

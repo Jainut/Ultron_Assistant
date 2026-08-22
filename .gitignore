@@ -18,3 +18,6 @@ ultron.env.cmd
 config/home.devices.json
 data/discovered-devices.json
 data/android-tv-pairings.json
+data/automation/
+data/notifications.json
+data/personal-automation/

@@ -7,6 +7,10 @@ import { createInterface } from "node:readline";
 import path from "node:path";
 import { servicePath } from "../config/runtime.ts";
 import { serviceError } from "../utils/debug.ts";
+import {
+    playAudio as playAudioFallback,
+    stopAudio as stopAudioFallback,
+} from "./audio_player.ts";
 
 interface PendingRequest {
     resolve: (audioPath: string) => void;
@@ -17,9 +21,40 @@ interface PendingRequest {
 
 interface ServiceMessage {
     id?: string;
-    type: "ready" | "audio_ready" | "error";
+    type:
+        | "ready"
+        | "audio_ready"
+        | "playback_started"
+        | "playback_finished"
+        | "playback_cancelled"
+        | "playback_flushed"
+        | "error";
     path?: string;
     error?: string;
+    capabilities?: unknown;
+}
+
+export function supportsPersistentPlayback(capabilities: unknown): boolean {
+    return Array.isArray(capabilities)
+        && capabilities.some(capability => capability === "playback-v1");
+}
+
+export interface PlaybackCallbacks {
+    onStarted?: () => void;
+    onFinished?: () => void;
+    onCancelled?: () => void;
+}
+
+export interface PlaybackOptions extends PlaybackCallbacks {
+    signal?: AbortSignal;
+}
+
+interface PendingPlayback extends PlaybackCallbacks {
+    resolve: () => void;
+    reject: (error: unknown) => void;
+    removeAbortListener?: () => void;
+    abortReason?: unknown;
+    started: boolean;
 }
 
 const ttsRoot = servicePath("tts-kokoro");
@@ -46,11 +81,14 @@ export class TextToSpeechService {
     private child: ChildProcessWithoutNullStreams | null = null;
 
     private ready = false;
+    private persistentPlaybackAvailable = false;
 
     private readonly pending = new Map<
         string,
         PendingRequest
     >();
+
+    private readonly pendingPlayback = new Map<string, PendingPlayback>();
 
     start(): Promise<void> {
         if (this.child) {
@@ -103,6 +141,7 @@ export class TextToSpeechService {
 
             this.child.once("close", (code) => {
                 this.ready = false;
+                this.persistentPlaybackAvailable = false;
                 this.child = null;
 
                 const error = new Error(
@@ -119,6 +158,12 @@ export class TextToSpeechService {
                 }
 
                 this.pending.clear();
+
+                for (const playback of this.pendingPlayback.values()) {
+                    playback.removeAbortListener?.();
+                    playback.reject(error);
+                }
+                this.pendingPlayback.clear();
             });
         });
     }
@@ -137,6 +182,9 @@ export class TextToSpeechService {
 
         if (message.type === "ready") {
             this.ready = true;
+            this.persistentPlaybackAvailable = supportsPersistentPlayback(
+                message.capabilities,
+            );
             resolveStart();
             return;
         }
@@ -145,11 +193,14 @@ export class TextToSpeechService {
             return;
         }
 
-        const request = this.pending.get(message.id);
-
-        if (!request) {
+        const playback = this.pendingPlayback.get(message.id);
+        if (playback !== undefined) {
+            this.handlePlaybackMessage(message.id, message, playback);
             return;
         }
+
+        const request = this.pending.get(message.id);
+        if (!request) return;
 
         this.pending.delete(message.id);
         request.removeAbortListener?.();
@@ -169,6 +220,55 @@ export class TextToSpeechService {
                 "O serviço não conseguiu gerar a fala.",
             ),
         );
+    }
+
+    private handlePlaybackMessage(
+        id: string,
+        message: ServiceMessage,
+        playback: PendingPlayback,
+    ): void {
+        if (message.type === "playback_started") {
+            playback.started = true;
+            playback.onStarted?.();
+            return;
+        }
+
+        if (
+            message.type !== "playback_finished"
+            && message.type !== "playback_cancelled"
+            && message.type !== "error"
+        ) {
+            return;
+        }
+
+        this.pendingPlayback.delete(id);
+        playback.removeAbortListener?.();
+
+        if (message.type === "error") {
+            playback.reject(new Error(
+                message.error ?? "O player persistente não conseguiu reproduzir o áudio.",
+            ));
+            return;
+        }
+
+        if (message.type === "playback_cancelled") {
+            playback.onCancelled?.();
+            if (playback.abortReason !== undefined) {
+                playback.reject(playback.abortReason);
+            } else {
+                playback.resolve();
+            }
+            return;
+        }
+
+        if (playback.abortReason !== undefined) {
+            playback.onCancelled?.();
+            playback.reject(playback.abortReason);
+            return;
+        }
+
+        playback.onFinished?.();
+        playback.resolve();
     }
 
     async synthesize(text: string, signal?: AbortSignal): Promise<string> {
@@ -232,6 +332,131 @@ export class TextToSpeechService {
         });
     }
 
+    /**
+     * Reproduz no mesmo processo Python do Kokoro quando playback-v1 está
+     * disponível. Serviços antigos e plataformas não suportadas preservam o
+     * SoundPlayer legado automaticamente.
+     */
+    async play(audioPath: string, options: PlaybackOptions = {}): Promise<void> {
+        if (!audioPath.trim()) {
+            throw new Error("O caminho do áudio está vazio.");
+        }
+        options.signal?.throwIfAborted();
+
+        if (!this.child || !this.ready || !this.persistentPlaybackAvailable) {
+            await this.playWithFallback(audioPath, options);
+            return;
+        }
+
+        const id = randomUUID();
+        let playbackState: PendingPlayback | undefined;
+        try {
+            await new Promise<void>((resolve, reject) => {
+                const abort = (): void => {
+                    const playback = this.pendingPlayback.get(id);
+                    if (playback === undefined) return;
+                    if (playback.abortReason !== undefined) return;
+                    playback.abortReason = options.signal?.reason
+                        ?? new DOMException("Playback cancelado.", "AbortError");
+                    this.writeMessage({ id, type: "cancel_playback" });
+                };
+                const removeAbortListener = options.signal
+                    ? (): void => options.signal?.removeEventListener("abort", abort)
+                    : undefined;
+
+                playbackState = {
+                    resolve,
+                    reject,
+                    removeAbortListener,
+                    onStarted: options.onStarted,
+                    onFinished: options.onFinished,
+                    onCancelled: options.onCancelled,
+                    started: false,
+                };
+                this.pendingPlayback.set(id, playbackState);
+
+                try {
+                    this.writeMessage({ id, type: "play", path: audioPath });
+                    options.signal?.addEventListener("abort", abort, { once: true });
+                    if (options.signal?.aborted) abort();
+                } catch (error) {
+                    this.pendingPlayback.delete(id);
+                    removeAbortListener?.();
+                    reject(error);
+                }
+            });
+        } catch (error) {
+            // Se o backend recusou antes de playback_started, ainda é seguro
+            // tentar o SoundPlayer legado sem duplicar áudio já iniciado.
+            if (
+                playbackState !== undefined
+                && !playbackState.started
+                && playbackState.abortReason === undefined
+            ) {
+                await this.playWithFallback(audioPath, options);
+                return;
+            }
+            throw error;
+        }
+    }
+
+    /** Cancela o áudio atual e qualquer item já enfileirado no player Python. */
+    stopPlayback(): void {
+        if (!this.persistentPlaybackAvailable || !this.child) {
+            stopAudioFallback();
+            return;
+        }
+
+        try {
+            this.writeMessage({
+                id: randomUUID(),
+                type: "flush_playback",
+            });
+        } catch (error) {
+            for (const [id, playback] of this.pendingPlayback) {
+                this.pendingPlayback.delete(id);
+                playback.removeAbortListener?.();
+                playback.reject(error);
+            }
+        }
+    }
+
+    isPersistentPlaybackAvailable(): boolean {
+        return this.persistentPlaybackAvailable;
+    }
+
+    private async playWithFallback(
+        audioPath: string,
+        options: PlaybackOptions,
+    ): Promise<void> {
+        let aborted = false;
+        const abort = (): void => {
+            aborted = true;
+            stopAudioFallback();
+        };
+        options.signal?.addEventListener("abort", abort, { once: true });
+        if (options.signal?.aborted) abort();
+        try {
+            options.onStarted?.();
+            await playAudioFallback(audioPath);
+            if (aborted) {
+                options.onCancelled?.();
+                throw options.signal?.reason
+                    ?? new DOMException("Playback cancelado.", "AbortError");
+            }
+            options.onFinished?.();
+        } finally {
+            options.signal?.removeEventListener("abort", abort);
+        }
+    }
+
+    private writeMessage(message: Record<string, unknown>): void {
+        if (!this.child || !this.child.stdin.writable) {
+            throw new Error("O serviço de voz não está disponível.");
+        }
+        this.child.stdin.write(`${JSON.stringify(message)}\n`);
+    }
+
     stop(): void {
         if (!this.child) {
             return;
@@ -245,9 +470,17 @@ export class TextToSpeechService {
         }
 
         this.pending.clear();
+
+        this.stopPlayback();
+        for (const playback of this.pendingPlayback.values()) {
+            playback.removeAbortListener?.();
+            playback.reject(error);
+        }
+        this.pendingPlayback.clear();
         this.child.stdin.end();
         this.child.kill();
         this.child = null;
         this.ready = false;
+        this.persistentPlaybackAvailable = false;
     }
 }

@@ -22,7 +22,21 @@ export type AndroidTvAction =
     | "mute"
     | "unmute"
     | "play"
-    | "pause";
+    | "pause"
+    | "stop"
+    | "home"
+    | "back"
+    | "up"
+    | "down"
+    | "left"
+    | "right"
+    | "select"
+    | "menu"
+    | "input"
+    | "channel_up"
+    | "channel_down"
+    | "next"
+    | "previous";
 
 interface PairingStore {
     [deviceId: string]: Certificate;
@@ -34,6 +48,8 @@ interface AndroidTvSession {
     startPromise: Promise<boolean>;
     readyPromise: Promise<void>;
     resolveReady: () => void;
+    poweredPromise: Promise<void>;
+    resolvePowered: () => void;
     certificateSavePromise?: Promise<void>;
     ready: boolean;
     pairingRequired: boolean;
@@ -45,8 +61,8 @@ interface AndroidTvSession {
 export class AndroidTvPairingRequiredError extends Error {
     constructor(public readonly deviceName: string) {
         super(
-            `Encontrei ${deviceName}. A TV estÃ¡ exibindo um PIN de pareamento. `
-            + "Diga \"cÃ³digo\" seguido dos seis dÃ­gitos para autorizar o Ultron uma Ãºnica vez.",
+            `Encontrei ${deviceName}. A TV está exibindo um PIN de pareamento. `
+            + "Diga \"código\" seguido dos seis dígitos para autorizar o Ultron uma única vez.",
         );
         this.name = "AndroidTvPairingRequiredError";
     }
@@ -62,7 +78,7 @@ const CONNECTION_TIMEOUT_MS = 8_000;
 const REMOTE_READY_TIMEOUT_MS = 5_000;
 
 function abortError(): Error {
-    return new DOMException("OperaÃ§Ã£o cancelada.", "AbortError");
+    return new DOMException("Operação cancelada.", "AbortError");
 }
 
 function waitFor<T>(promise: Promise<T>, timeoutMs: number, signal?: AbortSignal): Promise<T> {
@@ -101,7 +117,7 @@ export async function waitForAndroidTvHandshake(
 ): Promise<boolean> {
     const connected = await waitFor(startPromise, connectionTimeoutMs, signal);
 
-    // start() resolve no secureConnect. O controle sÃ³ estÃ¡ pronto quando a TV
+    // start() resolve no secureConnect. O controle só está pronto quando a TV
     // envia remoteConfigure e a biblioteca dispara o evento ready.
     if (connected && !isReady()) {
         await waitFor(readyPromise, readyTimeoutMs, signal);
@@ -140,18 +156,18 @@ class AndroidTvRemoteService {
 
         if (!connected) {
             this.disposeSession(device.ip);
-            throw new Error(`NÃ£o foi possÃ­vel conectar ao controle remoto de ${device.name}.`);
+            throw new Error(`Não foi possível conectar ao controle remoto de ${device.name}.`);
         }
 
-        return this.execute(session, action);
+        return this.execute(session, action, signal);
     }
 
     async beginPairing(device: DiscoveredDevice, signal?: AbortSignal): Promise<unknown> {
         signal?.throwIfAborted();
-        const session = await this.getSession(device, true);
+        const session = await this.getSession(device);
 
         if (session.ready) {
-            return { paired: true, message: `${device.name} jÃ¡ estÃ¡ pareada com o Ultron.` };
+            return { paired: true, message: `${device.name} já está pareada com o Ultron.` };
         }
 
         if (session.pairingRequired) {
@@ -173,7 +189,7 @@ class AndroidTvRemoteService {
             paired: connected,
             message: connected
                 ? `${device.name} pareada.`
-                : "O pareamento nÃ£o foi concluÃ­do pela TV.",
+                : "O pareamento não foi concluído pela TV.",
         };
     }
 
@@ -186,7 +202,7 @@ class AndroidTvRemoteService {
         const session = [...this.sessions.values()].find(item => item.pairingRequired);
 
         if (!session) {
-            throw new Error("NÃ£o hÃ¡ uma TV aguardando cÃ³digo de pareamento.");
+            throw new Error("Não há uma TV aguardando código de pareamento.");
         }
 
         if (!/^[A-Z0-9]{6}$/i.test(code)) {
@@ -198,7 +214,7 @@ class AndroidTvRemoteService {
 
         if (!accepted) {
             session.pairingRequired = true;
-            throw new Error("A TV nÃ£o aceitou o formato desse PIN.");
+            throw new Error("A TV não aceitou o formato desse PIN.");
         }
 
         const connected = await waitForAndroidTvHandshake(
@@ -211,7 +227,7 @@ class AndroidTvRemoteService {
 
         if (!connected) {
             this.disposeSession(session.device.ip);
-            throw new Error("A TV nÃ£o concluiu o pareamento. Solicite um novo PIN e tente novamente.");
+            throw new Error("A TV não concluiu o pareamento. Solicite um novo PIN e tente novamente.");
         }
 
         await session.certificateSavePromise;
@@ -220,7 +236,7 @@ class AndroidTvRemoteService {
         session.pendingAction = undefined;
 
         if (pendingAction) {
-            await this.execute(session, pendingAction);
+            await this.execute(session, pendingAction, signal);
         }
 
         return {
@@ -230,16 +246,16 @@ class AndroidTvRemoteService {
         };
     }
 
-    private async getSession(
-        device: DiscoveredDevice,
-        forcePairing = false,
-    ): Promise<AndroidTvSession> {
+    private async getSession(device: DiscoveredDevice): Promise<AndroidTvSession> {
         const existing = this.sessions.get(device.ip);
 
         if (existing) return existing;
 
         const store = await this.loadStore();
-        const storedCertificate = forcePairing ? undefined : store[device.id];
+        const storeKey = device.mac
+            ? `mac:${device.mac.replace(/[^0-9a-f]/gi, "").toUpperCase()}`
+            : device.id;
+        const storedCertificate = store[storeKey] ?? store[device.id];
         const remote = createAndroidRemote(device.ip, {
             cert: storedCertificate,
             service_name: "Ultron",
@@ -251,6 +267,10 @@ class AndroidTvRemoteService {
         const readyPromise = new Promise<void>(resolve => {
             resolveReady = resolve;
         });
+        let resolvePowered = (): void => undefined;
+        const poweredPromise = new Promise<void>(resolve => {
+            resolvePowered = resolve;
+        });
         const session: AndroidTvSession = {
             device,
             remote,
@@ -259,6 +279,8 @@ class AndroidTvRemoteService {
             startPromise: Promise.resolve(false),
             readyPromise,
             resolveReady,
+            poweredPromise,
+            resolvePowered,
         };
 
         remote.on("secret", () => {
@@ -274,7 +296,8 @@ class AndroidTvRemoteService {
             session.pairingRequired = false;
             if (session.pairingTimer) clearTimeout(session.pairingTimer);
             const certificate = remote.getCertificate();
-            store[device.id] = certificate;
+            store[storeKey] = certificate;
+            if (storeKey !== device.id) delete store[device.id];
             session.certificateSavePromise = this.saveStore(store).catch(error => {
                 debugLog("[ANDROID TV] Falha ao salvar pareamento:", error);
             });
@@ -283,12 +306,14 @@ class AndroidTvRemoteService {
         });
         remote.on("powered", powered => {
             session.powered = powered;
+            session.resolvePowered();
         });
         remote.on("unpaired", () => {
             session.ready = false;
+            delete store[storeKey];
             delete store[device.id];
             void this.saveStore(store).catch(error => {
-                debugLog("[ANDROID TV] Falha ao remover pareamento invÃ¡lido:", error);
+                debugLog("[ANDROID TV] Falha ao remover pareamento inválido:", error);
             }).finally(() => {
                 this.disposeSession(device.ip);
             });
@@ -324,8 +349,20 @@ class AndroidTvRemoteService {
         return session;
     }
 
-    private async execute(session: AndroidTvSession, action: AndroidTvAction): Promise<unknown> {
+    private async execute(
+        session: AndroidTvSession,
+        action: AndroidTvAction,
+        signal?: AbortSignal,
+    ): Promise<unknown> {
         if (action === "status") {
+            if (session.powered === undefined) {
+                try {
+                    await waitFor(session.poweredPromise, 600, signal);
+                } catch (error) {
+                    if (signal?.aborted) throw error;
+                }
+            }
+
             return { online: session.ready, powered: session.powered };
         }
 
@@ -359,11 +396,25 @@ class AndroidTvRemoteService {
             unmute: RemoteKeyCode.KEYCODE_VOLUME_MUTE,
             play: RemoteKeyCode.KEYCODE_MEDIA_PLAY,
             pause: RemoteKeyCode.KEYCODE_MEDIA_PAUSE,
+            stop: RemoteKeyCode.KEYCODE_MEDIA_STOP,
+            home: RemoteKeyCode.KEYCODE_HOME,
+            back: RemoteKeyCode.KEYCODE_BACK,
+            up: RemoteKeyCode.KEYCODE_DPAD_UP,
+            down: RemoteKeyCode.KEYCODE_DPAD_DOWN,
+            left: RemoteKeyCode.KEYCODE_DPAD_LEFT,
+            right: RemoteKeyCode.KEYCODE_DPAD_RIGHT,
+            select: RemoteKeyCode.KEYCODE_DPAD_CENTER,
+            menu: RemoteKeyCode.KEYCODE_MENU,
+            input: RemoteKeyCode.KEYCODE_TV_INPUT,
+            channel_up: RemoteKeyCode.KEYCODE_CHANNEL_UP,
+            channel_down: RemoteKeyCode.KEYCODE_CHANNEL_DOWN,
+            next: RemoteKeyCode.KEYCODE_MEDIA_NEXT,
+            previous: RemoteKeyCode.KEYCODE_MEDIA_PREVIOUS,
         };
         const key = keys[action];
 
         if (key === undefined) {
-            throw new Error(`AÃ§Ã£o ${action} nÃ£o suportada pela Android TV.`);
+            throw new Error(`Ação ${action} não suportada pela Android TV.`);
         }
 
         session.remote.sendKey(key);
@@ -377,7 +428,7 @@ class AndroidTvRemoteService {
             this.store = JSON.parse(await readFile(pairingPath, "utf8")) as PairingStore;
         } catch (error) {
             if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-                debugLog("[ANDROID TV] Pareamentos salvos invÃ¡lidos:", error);
+                debugLog("[ANDROID TV] Pareamentos salvos inválidos:", error);
             }
             this.store = {};
         }

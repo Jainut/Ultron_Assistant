@@ -1,0 +1,50 @@
+{
+  "cli": "services/speech-whisper/build/bin/whisper-cli.exe",
+  "models": [
+    {
+      "id": "small",
+      "paths": ["services/speech-whisper/ggml-small.bin"]
+    },
+    {
+      "id": "medium",
+      "paths": ["services/speech-whisper/ggml-medium.bin"]
+    },
+    {
+      "id": "large-v3-turbo",
+      "paths": [
+        "services/speech-whisper/ggml-large-v3-turbo.bin",
+        "services/speech-whisper/ggml-large-v3-turbo-q8_0.bin",
+        "services/speech-whisper/ggml-large-v3-turbo-q5_0.bin"
+      ]
+    }
+  ],
+  "promptTerms": [
+    "Ultron",
+    "Visual Studio Code",
+    "VS Code",
+    "Zen Browser",
+    "Spotify",
+    "YouTube",
+    "GitHub",
+    "Supabase",
+    "Vercel",
+    "Render",
+    "Node.js",
+    "TypeScript"
+  ],
+  "samples": [
+    {
+      "id": "jfk-en-labeled",
+      "audio": "services/speech-whisper/samples/jfk.wav",
+      "language": "en",
+      "reference": "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country.",
+      "criticalTerms": []
+    },
+    {
+      "id": "mic-test-pt-unlabeled",
+      "audio": "services/speech-vosk/mic-test.wav",
+      "language": "pt",
+      "criticalTerms": []
+    }
+  ]
+}

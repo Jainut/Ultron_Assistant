@@ -9,27 +9,246 @@ import path from "node:path";
 import { runtimeConfig, servicePath } from "../config/runtime.ts";
 import { debugLog, serviceError } from "../utils/debug.ts";
 import { perf } from "../utils/performance.ts";
+import type { PlaybackReference } from "./playback-reference.ts";
 
 
-interface CaptureMessage {
-    type:
-    | "ready"
-    | "input_device"
-    | "speech_start"
-    | "audio"
-    | "error";
+export type VoiceActivityDetector = "webrtcvad" | "rms";
 
-    path?: string;
-    error?: string;
-    device?: number;
-    name?: string;
-    fallback?: boolean;
+export interface CaptureEndpointMetrics {
+    readonly reason: "silence" | "timeout" | "discarded";
+    readonly speechDurationMs: number;
+    readonly voicedDurationMs: number;
+    readonly endpointDelayMs: number;
+    readonly silenceTargetMs: number;
+    readonly detector: VoiceActivityDetector;
+}
+
+export interface CaptureEchoSuppressionMetrics {
+    readonly correlation: number;
+    readonly residualRatio: number;
+    readonly delayMs: number;
+    readonly generation: number;
+    readonly processingMs: number;
+    readonly queueAgeMs: number;
+}
+
+export type CaptureMessage =
+    | {
+        readonly type: "ready";
+        readonly detector?: VoiceActivityDetector;
+        readonly endpoint?: {
+            readonly minimumMs: number;
+            readonly targetMs: number;
+            readonly maximumMs: number;
+        };
+        readonly echoReference?: {
+            readonly enabled: boolean;
+            readonly maximumDelayMs: number;
+            readonly correlationThreshold: number;
+            readonly residualRatioThreshold: number;
+        };
+    }
+    | {
+        readonly type: "input_device";
+        readonly device: number;
+        readonly name: string;
+        readonly fallback: boolean;
+    }
+    | {
+        readonly type: "speech_start";
+        readonly rms?: number;
+        readonly playback?: boolean;
+        readonly detector?: VoiceActivityDetector;
+    }
+    | ({ readonly type: "speech_end" } & CaptureEndpointMetrics)
+    | ({ readonly type: "echo_suppressed" } & CaptureEchoSuppressionMetrics)
+    | {
+        readonly type: "audio";
+        readonly path: string;
+        readonly endpoint?: CaptureEndpointMetrics;
+    }
+    | {
+        readonly type: "error";
+        readonly error: string;
+    };
+
+export function parseCaptureMessage(value: unknown): CaptureMessage | null {
+    if (!isRecord(value) || typeof value.type !== "string") return null;
+
+    switch (value.type) {
+        case "ready": {
+            const detector = optionalDetector(value.detector);
+            const endpoint = isEndpointConfiguration(value.endpoint)
+                ? value.endpoint
+                : undefined;
+            const echoReference = parseEchoReferenceConfiguration(
+                value.echoReference,
+            );
+            return {
+                type: "ready",
+                ...(detector ? { detector } : {}),
+                ...(endpoint ? { endpoint } : {}),
+                ...(echoReference ? { echoReference } : {}),
+            };
+        }
+        case "input_device":
+            return typeof value.device === "number"
+                && typeof value.name === "string"
+                && typeof value.fallback === "boolean"
+                ? {
+                    type: "input_device",
+                    device: value.device,
+                    name: value.name,
+                    fallback: value.fallback,
+                }
+                : null;
+        case "speech_start": {
+            const detector = optionalDetector(value.detector);
+            return {
+                type: "speech_start",
+                ...(typeof value.rms === "number" ? { rms: value.rms } : {}),
+                ...(typeof value.playback === "boolean"
+                    ? { playback: value.playback }
+                    : {}),
+                ...(detector ? { detector } : {}),
+            };
+        }
+        case "speech_end": {
+            const metrics = parseEndpointMetrics(value);
+            return metrics ? { type: "speech_end", ...metrics } : null;
+        }
+        case "echo_suppressed": {
+            const metrics = parseEchoSuppressionMetrics(value);
+            return metrics ? { type: "echo_suppressed", ...metrics } : null;
+        }
+        case "audio": {
+            if (typeof value.path !== "string" || !value.path) return null;
+            const endpoint = parseEndpointMetrics(value.endpoint);
+            return {
+                type: "audio",
+                path: value.path,
+                ...(endpoint ? { endpoint } : {}),
+            };
+        }
+        case "error":
+            return typeof value.error === "string"
+                ? { type: "error", error: value.error }
+                : null;
+        default:
+            return null;
+    }
+}
+
+function parseEchoReferenceConfiguration(value: unknown): {
+    enabled: boolean;
+    maximumDelayMs: number;
+    correlationThreshold: number;
+    residualRatioThreshold: number;
+} | undefined {
+    if (
+        !isRecord(value)
+        || typeof value.enabled !== "boolean"
+        || !isNonNegativeFinite(value.maximumDelayMs)
+        || !isUnitInterval(value.correlationThreshold)
+        || !isUnitInterval(value.residualRatioThreshold)
+    ) {
+        return undefined;
+    }
+    return {
+        enabled: value.enabled,
+        maximumDelayMs: value.maximumDelayMs,
+        correlationThreshold: value.correlationThreshold,
+        residualRatioThreshold: value.residualRatioThreshold,
+    };
+}
+
+function parseEchoSuppressionMetrics(
+    value: unknown,
+): CaptureEchoSuppressionMetrics | undefined {
+    if (
+        !isRecord(value)
+        || !isUnitInterval(value.correlation)
+        || !isUnitInterval(value.residualRatio)
+        || !isNonNegativeFinite(value.delayMs)
+        || !isNonNegativeSafeInteger(value.generation)
+        || !isNonNegativeFinite(value.processingMs)
+        || !isNonNegativeFinite(value.queueAgeMs)
+    ) {
+        return undefined;
+    }
+    return {
+        correlation: value.correlation,
+        residualRatio: value.residualRatio,
+        delayMs: value.delayMs,
+        generation: value.generation,
+        processingMs: value.processingMs,
+        queueAgeMs: value.queueAgeMs,
+    };
+}
+
+function parseEndpointMetrics(value: unknown): CaptureEndpointMetrics | undefined {
+    if (!isRecord(value)) return undefined;
+    const reason = value.reason;
+    const detector = optionalDetector(value.detector);
+    if (
+        (reason !== "silence" && reason !== "timeout" && reason !== "discarded")
+        || !detector
+        || !isNonNegativeFinite(value.speechDurationMs)
+        || !isNonNegativeFinite(value.voicedDurationMs)
+        || !isNonNegativeFinite(value.endpointDelayMs)
+        || !isNonNegativeFinite(value.silenceTargetMs)
+    ) {
+        return undefined;
+    }
+    return {
+        reason,
+        detector,
+        speechDurationMs: value.speechDurationMs,
+        voicedDurationMs: value.voicedDurationMs,
+        endpointDelayMs: value.endpointDelayMs,
+        silenceTargetMs: value.silenceTargetMs,
+    };
+}
+
+function optionalDetector(value: unknown): VoiceActivityDetector | undefined {
+    return value === "webrtcvad" || value === "rms" ? value : undefined;
+}
+
+function isEndpointConfiguration(value: unknown): value is {
+    minimumMs: number;
+    targetMs: number;
+    maximumMs: number;
+} {
+    return isRecord(value)
+        && isNonNegativeFinite(value.minimumMs)
+        && isNonNegativeFinite(value.targetMs)
+        && isNonNegativeFinite(value.maximumMs);
+}
+
+function isNonNegativeFinite(value: unknown): value is number {
+    return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+function isUnitInterval(value: unknown): value is number {
+    return isNonNegativeFinite(value) && value <= 1;
+}
+
+function isNonNegativeSafeInteger(value: unknown): value is number {
+    return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+    return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 
 export class SpeechToTextService {
     private readonly speechStartListeners =
         new Set<() => void>();
+    private readonly speechEndListeners =
+        new Set<(metrics?: CaptureEndpointMetrics) => void>();
+    private readonly transcriptionStartListeners = new Set<() => void>();
+    private readonly transcriptionEndListeners = new Set<() => void>();
     private whisperProcess: ChildProcessByStdio<null, Readable, Readable> | null = null;
     private captureProcess: ChildProcessWithoutNullStreams | null = null;
 
@@ -38,6 +257,7 @@ export class SpeechToTextService {
     private pendingResolve: ((text: string) => void) | null = null;
     private pendingReject: ((error: Error) => void) | null = null;
     private readonly recentTranscriptions: string[] = [];
+    private speechEndDelivered = false;
 
 
     private readonly whisperPort = runtimeConfig.whisperPort;
@@ -58,6 +278,23 @@ export class SpeechToTextService {
                 listener,
             );
         };
+    }
+
+    onSpeechEnd(
+        listener: (metrics?: CaptureEndpointMetrics) => void,
+    ): () => void {
+        this.speechEndListeners.add(listener);
+        return () => this.speechEndListeners.delete(listener);
+    }
+
+    onTranscriptionStart(listener: () => void): () => void {
+        this.transcriptionStartListeners.add(listener);
+        return () => this.transcriptionStartListeners.delete(listener);
+    }
+
+    onTranscriptionEnd(listener: () => void): () => void {
+        this.transcriptionEndListeners.add(listener);
+        return () => this.transcriptionEndListeners.delete(listener);
     }
 
     async start(): Promise<void> {
@@ -171,6 +408,14 @@ export class SpeechToTextService {
                     PYTHONIOENCODING: "utf-8",
                     PYTHONUTF8: "1",
                     PYTHONUNBUFFERED: "1",
+                    ULTRON_ENDPOINT_MIN_MS: String(runtimeConfig.sttEndpointMinMs),
+                    ULTRON_ENDPOINT_TARGET_MS: String(runtimeConfig.sttEndpointTargetMs),
+                    ULTRON_ENDPOINT_MAX_MS: String(runtimeConfig.sttEndpointMaxMs),
+                    ULTRON_MIN_VOICED_SECONDS: String(
+                        runtimeConfig.sttMinimumVoicedMs / 1_000,
+                    ),
+                    ULTRON_VAD_ENABLED: runtimeConfig.sttVadEnabled ? "1" : "0",
+                    ULTRON_VAD_MODE: String(runtimeConfig.sttVadMode),
                 },
 
                 windowsHide: true,
@@ -218,10 +463,11 @@ export class SpeechToTextService {
                     }
 
                     try {
-                        const message =
-                            JSON.parse(
-                                trimmed
-                            ) as CaptureMessage;
+                        const message = parseCaptureMessage(
+                            JSON.parse(trimmed) as unknown,
+                        );
+
+                        if (!message) continue;
 
                         void this.handleCaptureMessage(
                             message
@@ -306,6 +552,12 @@ export class SpeechToTextService {
             this.captureReady =
                 true;
 
+            debugLog("[STT] Captura pronta:", {
+                detector: message.detector ?? "rms",
+                endpoint: message.endpoint,
+                echoReference: message.echoReference,
+            });
+
             return;
         }
 
@@ -322,6 +574,7 @@ export class SpeechToTextService {
             message.type ===
             "speech_start"
         ) {
+            this.speechEndDelivered = false;
             debugLog(
                 "[BARGE] speech_start recebido do Python."
             );
@@ -333,6 +586,24 @@ export class SpeechToTextService {
                 listener();
             }
 
+            return;
+        }
+
+        if (message.type === "speech_end") {
+            this.emitSpeechEnd(message);
+            return;
+        }
+
+        if (message.type === "echo_suppressed") {
+            perf.record("Echo filter", message.processingMs);
+            debugLog("[BARGE][ECHO] Referência do playback suprimida:", {
+                correlation: message.correlation,
+                residualRatio: message.residualRatio,
+                delayMs: message.delayMs,
+                generation: message.generation,
+                processingMs: message.processingMs,
+                queueAgeMs: message.queueAgeMs,
+            });
             return;
         }
 
@@ -360,6 +631,11 @@ export class SpeechToTextService {
             "audio"
             && message.path
         ) {
+            if (!this.speechEndDelivered) {
+                this.emitSpeechEnd(message.endpoint);
+            }
+            for (const listener of this.transcriptionStartListeners) listener();
+
             try {
                 const text =
                     await this.transcribe(
@@ -397,6 +673,8 @@ export class SpeechToTextService {
 
 
                 this.clearPending();
+            } finally {
+                for (const listener of this.transcriptionEndListeners) listener();
             }
         }
     }
@@ -565,6 +843,24 @@ export class SpeechToTextService {
         });
     }
 
+    startPlaybackReference(reference: PlaybackReference): void {
+        this.sendCapture({
+            type: "playback_reference_start",
+            path: reference.path,
+            generation: reference.generation,
+            startedAtUnixMs: reference.startedAtUnixMs,
+        });
+    }
+
+    endPlaybackReference(reference: PlaybackReference): void {
+        this.sendCapture({
+            type: "playback_reference_end",
+            path: reference.path,
+            generation: reference.generation,
+            startedAtUnixMs: reference.startedAtUnixMs,
+        });
+    }
+
 
     private sendCapture(
         message: object
@@ -581,6 +877,25 @@ export class SpeechToTextService {
                 message
             ) + "\n"
         );
+    }
+
+
+    private emitSpeechEnd(metrics?: CaptureEndpointMetrics): void {
+        if (this.speechEndDelivered) return;
+        this.speechEndDelivered = true;
+
+        if (metrics) {
+            perf.record("STT endpoint delay", metrics.endpointDelayMs);
+            debugLog("[STT] Endpoint:", {
+                reason: metrics.reason,
+                delayMs: metrics.endpointDelayMs,
+                targetMs: metrics.silenceTargetMs,
+                voicedMs: metrics.voicedDurationMs,
+                detector: metrics.detector,
+            });
+        }
+
+        for (const listener of this.speechEndListeners) listener(metrics);
     }
 
 
@@ -602,6 +917,7 @@ export class SpeechToTextService {
         this.whisperProcess = null;
 
         this.captureReady = false;
+        this.speechEndDelivered = false;
 
         this.clearPending();
     }
