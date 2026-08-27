@@ -1,17 +1,36 @@
+from time import perf_counter
+
+service_module_started_at = perf_counter()
+
 import json
 import queue
 import sys
 import threading
 import traceback
 from pathlib import Path
+
+stdlib_imports_ms = (
+    perf_counter() - service_module_started_at
+) * 1000
+
+player_import_started_at = perf_counter()
 from persistent_player import (
     PersistentWavePlayer,
     create_system_player,
 )
+player_import_ms = (
+    perf_counter() - player_import_started_at
+) * 1000
+
+voice_engine_import_started_at = perf_counter()
 from voice_engine import (
     generate_audio,
+    get_startup_metrics,
     warm_up,
 )
+voice_engine_import_ms = (
+    perf_counter() - voice_engine_import_started_at
+) * 1000
 
 
 def send_message(message: dict) -> None:
@@ -154,13 +173,31 @@ def main() -> None:
     global playback_player
     warm_up()
 
+    player_initialization_started_at = perf_counter()
     playback_player = create_system_player(send_message)
+    player_initialization_ms = (
+        perf_counter() - player_initialization_started_at
+    ) * 1000
 
+    worker_initialization_started_at = perf_counter()
     worker = threading.Thread(
         target=synthesis_worker,
         daemon=True,
     )
     worker.start()
+    worker_initialization_ms = (
+        perf_counter() - worker_initialization_started_at
+    ) * 1000
+
+    engine_metrics = get_startup_metrics()
+    pipeline_initialization_ms = engine_metrics.get(
+        "pipelineInitializationMs",
+        0.0,
+    )
+    voice_dependencies_ms = max(
+        0.0,
+        voice_engine_import_ms - pipeline_initialization_ms,
+    )
 
     send_message({
         "type": "ready",
@@ -168,6 +205,18 @@ def main() -> None:
             "synthesis-v1",
             *(["playback-v1"] if playback_player is not None else []),
         ],
+        "startup": {
+            "stdlibImportsMs": stdlib_imports_ms,
+            "playerImportMs": player_import_ms,
+            "voiceDependenciesMs": voice_dependencies_ms,
+            "voiceEngineImportMs": voice_engine_import_ms,
+            **engine_metrics,
+            "playerInitializationMs": player_initialization_ms,
+            "workerInitializationMs": worker_initialization_ms,
+            "serviceReadyMs": (
+                perf_counter() - service_module_started_at
+            ) * 1000,
+        },
     })
 
     for line in sys.stdin:

@@ -33,10 +33,23 @@ pipeline = KPipeline(
     lang_code="p",
 )
 
+PIPELINE_INITIALIZATION_MS = (
+    perf_counter() - pipeline_started_at
+) * 1000
+_last_warm_up_metrics: dict[str, float] = {}
+
 log(
     f"KPipeline initialization: "
-    f"{perf_counter() - pipeline_started_at:.2f}s"
+    f"{PIPELINE_INITIALIZATION_MS / 1000:.2f}s"
 )
+
+
+def get_startup_metrics() -> dict[str, float]:
+    """Return a snapshot for the optional service-ready telemetry contract."""
+    return {
+        "pipelineInitializationMs": PIPELINE_INITIALIZATION_MS,
+        **_last_warm_up_metrics,
+    }
 
 def apply_effects(
     audio: np.ndarray,
@@ -212,6 +225,8 @@ def generate_audio(
     return output_file
 
 def warm_up() -> None:
+    global _last_warm_up_metrics
+
     started_at = perf_counter()
 
     log("Starting warm-up...")
@@ -239,10 +254,16 @@ def warm_up() -> None:
             )
         )
 
+    kokoro_warm_up_ms = (
+        perf_counter() - kokoro_started_at
+    ) * 1000
+
     log(
         f"Kokoro warm-up: "
-        f"{perf_counter() - kokoro_started_at:.3f}s"
+        f"{kokoro_warm_up_ms / 1000:.3f}s"
     )
+
+    effects_warm_up_ms = 0.0
 
     if generated_chunks and PITCH_STEPS:
         effects_started_at = perf_counter()
@@ -265,12 +286,25 @@ def warm_up() -> None:
             n_steps=PITCH_STEPS,
         )
 
+        effects_warm_up_ms = (
+            perf_counter() - effects_started_at
+        ) * 1000
+
         log(
             f"Effects warm-up: "
-            f"{perf_counter() - effects_started_at:.3f}s"
+            f"{effects_warm_up_ms / 1000:.3f}s"
         )
+
+    warm_up_total_ms = (
+        perf_counter() - started_at
+    ) * 1000
+    _last_warm_up_metrics = {
+        "kokoroWarmUpMs": kokoro_warm_up_ms,
+        "effectsWarmUpMs": effects_warm_up_ms,
+        "warmUpTotalMs": warm_up_total_ms,
+    }
 
     log(
         f"Warm-up completed: "
-        f"{perf_counter() - started_at:.3f}s"
+        f"{warm_up_total_ms / 1000:.3f}s"
     )

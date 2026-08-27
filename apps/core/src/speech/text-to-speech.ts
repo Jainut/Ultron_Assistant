@@ -7,6 +7,7 @@ import { createInterface } from "node:readline";
 import path from "node:path";
 import { servicePath } from "../config/runtime.ts";
 import { serviceError } from "../utils/debug.ts";
+import { perf } from "../utils/performance.ts";
 import {
     playAudio as playAudioFallback,
     stopAudio as stopAudioFallback,
@@ -32,6 +33,49 @@ interface ServiceMessage {
     path?: string;
     error?: string;
     capabilities?: unknown;
+    startup?: unknown;
+}
+
+const ttsStartupMetricDefinitions = [
+    ["stdlibImportsMs", "TTS Python imports"],
+    ["playerImportMs", "TTS player import"],
+    ["voiceEngineImportMs", "TTS voice module"],
+    ["voiceDependenciesMs", "TTS dependencies"],
+    ["pipelineInitializationMs", "TTS pipeline init"],
+    ["kokoroWarmUpMs", "TTS Kokoro warm-up"],
+    ["effectsWarmUpMs", "TTS effects warm-up"],
+    ["warmUpTotalMs", "TTS warm-up total"],
+    ["playerInitializationMs", "TTS player init"],
+    ["workerInitializationMs", "TTS worker init"],
+    ["serviceReadyMs", "TTS Python ready"],
+] as const;
+
+type TtsStartupMetricName = typeof ttsStartupMetricDefinitions[number][0];
+export type TtsStartupMetrics = Readonly<Partial<
+    Record<TtsStartupMetricName, number>
+>>;
+
+/** Sanitizes optional telemetry while preserving compatibility with old services. */
+export function parseTtsStartupMetrics(value: unknown): TtsStartupMetrics | null {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+        return null;
+    }
+
+    const source = value as Record<string, unknown>;
+    const parsed: Partial<Record<TtsStartupMetricName, number>> = {};
+
+    for (const [name] of ttsStartupMetricDefinitions) {
+        const elapsed = source[name];
+        if (
+            typeof elapsed === "number"
+            && Number.isFinite(elapsed)
+            && elapsed >= 0
+        ) {
+            parsed[name] = elapsed;
+        }
+    }
+
+    return Object.keys(parsed).length > 0 ? parsed : null;
 }
 
 export function supportsPersistentPlayback(capabilities: unknown): boolean {
@@ -47,6 +91,14 @@ export interface PlaybackCallbacks {
 
 export interface PlaybackOptions extends PlaybackCallbacks {
     signal?: AbortSignal;
+}
+
+export interface TextToSpeechServiceOptions {
+    /** Allows lifecycle tests without loading Kokoro or opening an audio device. */
+    spawnService?: typeof spawn;
+    startupTimeoutMs?: number;
+    /** Diagnostics need player-confirmed timestamps, not the legacy estimate. */
+    requirePersistentPlayback?: boolean;
 }
 
 interface PendingPlayback extends PlaybackCallbacks {
@@ -79,6 +131,8 @@ const outputDirectory = path.join(
 
 export class TextToSpeechService {
     private child: ChildProcessWithoutNullStreams | null = null;
+    private startupPromise: Promise<void> | null = null;
+    private rejectStartup: ((error: Error) => void) | null = null;
 
     private ready = false;
     private persistentPlaybackAvailable = false;
@@ -90,15 +144,42 @@ export class TextToSpeechService {
 
     private readonly pendingPlayback = new Map<string, PendingPlayback>();
 
+    constructor(private readonly options: TextToSpeechServiceOptions = {}) {}
+
     start(): Promise<void> {
-        if (this.child) {
+        if (this.child && this.ready) {
             return Promise.resolve();
         }
 
-        return new Promise((resolve, reject) => {
-            let startupSettled = false;
+        if (this.startupPromise) {
+            return this.startupPromise;
+        }
 
-            this.child = spawn(
+        const startupPromise = new Promise<void>((resolve, reject) => {
+            let startupSettled = false;
+            let startupTimeout: NodeJS.Timeout | undefined;
+
+            const clearStartup = (): void => {
+                if (startupTimeout) clearTimeout(startupTimeout);
+                if (this.rejectStartup === rejectStartup) this.rejectStartup = null;
+            };
+
+            const resolveStartup = (): void => {
+                if (startupSettled) return;
+                startupSettled = true;
+                clearStartup();
+                resolve();
+            };
+
+            const rejectStartup = (error: Error): void => {
+                if (startupSettled) return;
+                startupSettled = true;
+                clearStartup();
+                reject(error);
+            };
+            this.rejectStartup = rejectStartup;
+
+            const child = (this.options.spawnService ?? spawn)(
                 pythonExecutable,
                 [
                     "-u",
@@ -118,59 +199,102 @@ export class TextToSpeechService {
                     },
                 },
             );
+            this.child = child;
 
             const lines = createInterface({
-                input: this.child.stdout,
+                input: child.stdout,
             });
 
             lines.on("line", (line) => {
+                if (this.child !== child) return;
                 this.handleMessage(line, () => {
-                    startupSettled = true;
-                    resolve();
-                });
+                    resolveStartup();
+                }, handleProcessError);
             });
 
-            this.child.stderr.on("data", (chunk: Buffer) => {
+            child.stderr.on("data", (chunk: Buffer) => {
                 serviceError("[Kokoro]", chunk.toString());
             });
 
-            this.child.once("error", (error) => {
-                startupSettled = true;
-                reject(error);
-            });
+            const handleProcessError = (error: Error): void => {
+                if (this.child === child) {
+                    this.ready = false;
+                    this.persistentPlaybackAvailable = false;
+                    this.child = null;
 
-            this.child.once("close", (code) => {
-                this.ready = false;
-                this.persistentPlaybackAvailable = false;
-                this.child = null;
+                    for (const request of this.pending.values()) {
+                        request.removeAbortListener?.();
+                        request.reject(error);
+                    }
+                    this.pending.clear();
+
+                    for (const playback of this.pendingPlayback.values()) {
+                        playback.removeAbortListener?.();
+                        playback.reject(error);
+                    }
+                    this.pendingPlayback.clear();
+                    child.kill();
+                }
+                rejectStartup(error);
+            };
+            child.once("error", handleProcessError);
+            // EPIPE can arrive on stdin without a child-process error/close.
+            child.stdin.on("error", handleProcessError);
+
+            const configuredTimeout = this.options.startupTimeoutMs ?? 180_000;
+            const timeoutMs = Number.isFinite(configuredTimeout) && configuredTimeout > 0
+                ? configuredTimeout : 180_000;
+            startupTimeout = setTimeout(() => handleProcessError(new Error(
+                "O serviço Kokoro excedeu o tempo limite de inicialização.",
+            )), timeoutMs);
+
+            child.once("close", (code) => {
+                const ownsCurrentProcess = this.child === child;
+                if (ownsCurrentProcess) {
+                    this.ready = false;
+                    this.persistentPlaybackAvailable = false;
+                    this.child = null;
+                }
 
                 const error = new Error(
                     `O serviço Kokoro encerrou com código ${code}.`,
                 );
 
                 if (!startupSettled) {
-                    startupSettled = true;
-                    reject(error);
+                    rejectStartup(error);
                 }
 
-                for (const request of this.pending.values()) {
-                    request.reject(error);
-                }
+                if (ownsCurrentProcess) {
+                    for (const request of this.pending.values()) {
+                        request.removeAbortListener?.();
+                        request.reject(error);
+                    }
 
-                this.pending.clear();
+                    this.pending.clear();
 
-                for (const playback of this.pendingPlayback.values()) {
-                    playback.removeAbortListener?.();
-                    playback.reject(error);
+                    for (const playback of this.pendingPlayback.values()) {
+                        playback.removeAbortListener?.();
+                        playback.reject(error);
+                    }
+                    this.pendingPlayback.clear();
                 }
-                this.pendingPlayback.clear();
             });
         });
+
+        this.startupPromise = startupPromise;
+        const clearStartupPromise = (): void => {
+            if (this.startupPromise === startupPromise) {
+                this.startupPromise = null;
+            }
+        };
+        void startupPromise.then(clearStartupPromise, clearStartupPromise);
+        return startupPromise;
     }
 
     private handleMessage(
         line: string,
         resolveStart: () => void,
+        rejectService?: (error: Error) => void,
     ): void {
         let message: ServiceMessage;
 
@@ -180,11 +304,26 @@ export class TextToSpeechService {
             return;
         }
 
+        if (!message || typeof message !== "object") return;
+        if (message.type === "error" && !message.id) {
+            rejectService?.(new Error(
+                message.error ?? "O serviço Kokoro informou um erro fatal.",
+            ));
+            return;
+        }
+
         if (message.type === "ready") {
             this.ready = true;
             this.persistentPlaybackAvailable = supportsPersistentPlayback(
                 message.capabilities,
             );
+            const startupMetrics = parseTtsStartupMetrics(message.startup);
+            if (startupMetrics) {
+                for (const [name, label] of ttsStartupMetricDefinitions) {
+                    const elapsed = startupMetrics[name];
+                    if (elapsed !== undefined) perf.record(label, elapsed);
+                }
+            }
             resolveStart();
             return;
         }
@@ -344,6 +483,9 @@ export class TextToSpeechService {
         options.signal?.throwIfAborted();
 
         if (!this.child || !this.ready || !this.persistentPlaybackAvailable) {
+            if (this.options.requirePersistentPlayback) {
+                throw new Error("O player persistente não está disponível para esta calibração.");
+            }
             await this.playWithFallback(audioPath, options);
             return;
         }
@@ -392,6 +534,7 @@ export class TextToSpeechService {
                 playbackState !== undefined
                 && !playbackState.started
                 && playbackState.abortReason === undefined
+                && !this.options.requirePersistentPlayback
             ) {
                 await this.playWithFallback(audioPath, options);
                 return;
@@ -458,11 +601,12 @@ export class TextToSpeechService {
     }
 
     stop(): void {
+        const error = new Error("O serviço de voz foi encerrado.");
+        this.rejectStartup?.(error);
+        this.startupPromise = null;
         if (!this.child) {
             return;
         }
-
-        const error = new Error("O serviço de voz foi encerrado.");
 
         for (const request of this.pending.values()) {
             request.removeAbortListener?.();

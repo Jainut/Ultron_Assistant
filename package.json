@@ -10,6 +10,7 @@
     "dev": "npm --prefix apps/core run dev",
     "build": "npm --prefix apps/core run build",
     "start": "npm --prefix apps/core run start",
+    "calibrate:barge-in": "npm --prefix apps/core run calibrate:barge-in --",
     "check": "npm --prefix apps/core run check",
     "test": "npm --prefix apps/core run test"
   },

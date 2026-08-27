@@ -380,34 +380,26 @@ async function main(): Promise<void> {
         debugLog(
             "Carregando sistema de voz..."
         );
-
-        perf.start(
-            "TTS startup",
-        );
-
-        await tts.start();
-
-        perf.end(
-            "TTS startup",
-        );
-
-        debugLog(
-            "Serviço de voz carregado."
-        );
-
         debugLog(
             "Carregando reconhecimento de voz..."
         );
 
-        perf.start(
-            "STT startup",
-        );
-
-        await stt.start();
-
-        perf.end(
-            "STT startup",
-        );
+        await Promise.all([
+            perf.measure(
+                "TTS startup",
+                async () => {
+                    await tts.start();
+                    debugLog("Serviço de voz carregado.");
+                },
+            ),
+            perf.measure(
+                "STT startup",
+                async () => {
+                    await stt.start();
+                    debugLog("Reconhecimento de voz carregado.");
+                },
+            ),
+        ]);
 
         // Registra as tools determinísticas antes de aceitar o primeiro comando.
         // O carregamento dos jobs persistidos continua em background.

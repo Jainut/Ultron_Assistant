@@ -166,6 +166,20 @@ ECHO_TELEMETRY_INTERVAL_MS = max(
     ),
 )
 
+# Private capture-only mode used by the guided acoustic calibrator. The normal
+# STT process does not set this variable, so its WAV/pause/audio contract stays
+# exactly as before. In observe-only mode microphone samples are never written
+# to disk and no `audio` message is emitted.
+CAPTURE_OBSERVE_ONLY = os.getenv(
+    "ULTRON_CAPTURE_OBSERVE_ONLY",
+    "0",
+).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
 ECHO_REFERENCE_CONFIG = EchoReferenceConfig(
     sample_rate=SAMPLE_RATE,
     minimum_delay_ms=ECHO_DELAY_MIN_MS,
@@ -374,6 +388,61 @@ def save_wav(
     return filename
 
 
+def build_audio_message(
+    recorded_blocks: list[np.ndarray],
+    endpoint_metrics: dict,
+    *,
+    observe_only: bool | None = None,
+) -> dict | None:
+    """Persist a completed utterance only for the normal STT contract.
+
+    Keeping this boundary explicit makes the calibrator privacy invariant
+    deterministic to test: observe-only returns before concatenating samples or
+    calling ``save_wav``.
+    """
+
+    should_observe_only = (
+        CAPTURE_OBSERVE_ONLY
+        if observe_only is None
+        else bool(observe_only)
+    )
+    if should_observe_only:
+        return None
+    if not recorded_blocks:
+        raise ValueError("recorded audio cannot be empty")
+
+    audio = np.concatenate(recorded_blocks)
+    wav_path = save_wav(audio)
+    return {
+        "type": "audio",
+        "path": str(wav_path),
+        "endpoint": endpoint_metrics,
+    }
+
+
+def build_speech_start_message(
+    *,
+    rms: float,
+    playback: bool,
+    detector: str,
+    detection_latency_ms: float,
+    queue_age_ms: float,
+) -> dict:
+    """Build content-free numeric telemetry for a detected speech start."""
+
+    return {
+        "type": "speech_start",
+        "rms": float(rms),
+        "playback": bool(playback),
+        "detector": detector,
+        "detectionLatencyMs": round(
+            max(0.0, float(detection_latency_ms)),
+            3,
+        ),
+        "queueAgeMs": round(max(0.0, float(queue_age_ms)), 3),
+    }
+
+
 @contextmanager
 def open_input_stream():
     devices = sd.query_devices()
@@ -473,11 +542,13 @@ def main() -> None:
     ) = None
     playback_active = False
     speech_candidate_blocks = 0
+    first_candidate_block_started_ms: float | None = None
     last_echo_telemetry_at = 0.0
 
     with open_input_stream():
         send_message({
             "type": "ready",
+            "observeOnly": CAPTURE_OBSERVE_ONLY,
             "detector": speech_detector.name,
             "endpoint": {
                 "minimumMs": round(ENDPOINT_MIN_SECONDS * 1000),
@@ -517,6 +588,7 @@ def main() -> None:
                     endpoint.reset()
                     speech_started_at = None
                     speech_candidate_blocks = 0
+                    first_candidate_block_started_ms = None
 
                     clear_audio_queue()
 
@@ -530,6 +602,7 @@ def main() -> None:
                     endpoint.reset()
                     speech_started_at = None
                     speech_candidate_blocks = 0
+                    first_candidate_block_started_ms = None
 
                     clear_audio_queue()
 
@@ -540,6 +613,7 @@ def main() -> None:
                 elif control_type == "playback":
                     playback_active = bool(control.get("active", False))
                     speech_candidate_blocks = 0
+                    first_candidate_block_started_ms = None
                     if not playback_active:
                         echo_reference.clear()
 
@@ -627,6 +701,7 @@ def main() -> None:
                         # assistant's reference audio back to Whisper.
                         pre_roll.append(np.zeros_like(block))
                         speech_candidate_blocks = 0
+                        first_candidate_block_started_ms = None
 
                         if (
                             evaluation_now_monotonic_ms
@@ -673,8 +748,13 @@ def main() -> None:
 
                 if not is_speech:
                     speech_candidate_blocks = 0
+                    first_candidate_block_started_ms = None
                     continue
 
+                if speech_candidate_blocks == 0:
+                    first_candidate_block_started_ms = (
+                        block_started_monotonic_ms
+                    )
                 speech_candidate_blocks += 1
 
                 if (
@@ -695,18 +775,28 @@ def main() -> None:
                     time.monotonic()
                 )
 
-                recorded_blocks.extend(
-                    list(pre_roll)
-                )
+                if not CAPTURE_OBSERVE_ONLY:
+                    recorded_blocks.extend(
+                        list(pre_roll)
+                    )
 
                 pre_roll.clear()
 
-                send_message({
-                    "type": "speech_start",
-                    "rms": rms,
-                    "playback": playback_active,
-                    "detector": speech_detector.name,
-                })
+                candidate_started_at = (
+                    first_candidate_block_started_ms
+                    if first_candidate_block_started_ms is not None
+                    else block_started_monotonic_ms
+                )
+                send_message(build_speech_start_message(
+                    rms=rms,
+                    playback=playback_active,
+                    detector=speech_detector.name,
+                    detection_latency_ms=(
+                        evaluation_now_monotonic_ms - candidate_started_at
+                    ),
+                    queue_age_ms=queue_age_ms,
+                ))
+                first_candidate_block_started_ms = None
 
                 continue
 
@@ -715,9 +805,10 @@ def main() -> None:
             # GRAVANDO
             # =========================
 
-            recorded_blocks.append(
-                block
-            )
+            if not CAPTURE_OBSERVE_ONLY:
+                recorded_blocks.append(
+                    block
+                )
 
             endpoint_decision = endpoint.observe(is_speech)
 
@@ -765,6 +856,7 @@ def main() -> None:
 
                 endpoint.reset()
                 speech_started_at = None
+                first_candidate_block_started_ms = None
 
                 send_message({
                     "type": "speech_end",
@@ -810,13 +902,20 @@ def main() -> None:
             })
 
 
-            audio = np.concatenate(
-                recorded_blocks
+            audio_message = build_audio_message(
+                recorded_blocks,
+                endpoint_metrics,
             )
 
-            wav_path = save_wav(
-                audio
-            )
+            if audio_message is None:
+                # The isolated calibrator observes the exact VAD/endpoint path
+                # but must never persist or transcribe microphone content.
+                recorded_blocks.clear()
+                pre_roll.clear()
+                endpoint.reset()
+                speech_started_at = None
+                first_candidate_block_started_ms = None
+                continue
 
 
             # Pausa antes de entregar
@@ -829,11 +928,7 @@ def main() -> None:
             clear_audio_queue()
 
 
-            send_message({
-                "type": "audio",
-                "path": str(wav_path),
-                "endpoint": endpoint_metrics,
-            })
+            send_message(audio_message)
 
 
             recorded_blocks.clear()
@@ -841,6 +936,7 @@ def main() -> None:
 
             endpoint.reset()
             speech_started_at = None
+            first_candidate_block_started_ms = None
 
 
 if __name__ == "__main__":

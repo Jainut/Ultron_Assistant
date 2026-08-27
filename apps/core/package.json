@@ -7,6 +7,7 @@
     "dev": "tsx src/index.ts",
     "hud": "tsx src/interface/preview.ts",
     "test:tts": "tsx src/dev/test-tts.ts",
+    "calibrate:barge-in": "tsx src/dev/calibrate-barge-in.ts",
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
     "build": "npm run clean && tsc",
     "start": "node dist/src/index.js",

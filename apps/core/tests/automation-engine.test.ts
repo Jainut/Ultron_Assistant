@@ -264,7 +264,9 @@ test("Scheduler avança interval após esgotar retries e mantém a falha atravé
         assert.equal(succeeded?.retryCount, 0);
         assert.equal(succeeded?.lastResult?.status, "succeeded");
         assert.equal(succeeded?.lastError, undefined);
-        assert.ok(Date.parse(succeeded!.nextRun!) > Date.now() - 5);
+        // Compare persisted event times, not a 5 ms wall-clock window: disk I/O
+        // and other test workers may legitimately outlive the 50 ms interval.
+        assert.ok(Date.parse(succeeded!.nextRun!) > Date.parse(succeeded!.lastCompletedAt!));
     } finally {
         await rm(temporaryRoot, { recursive: true, force: true });
     }
