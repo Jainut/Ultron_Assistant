@@ -29,6 +29,9 @@ const mimeTypes: Record<string, string> = {
 export class HudServer {
     private server: Server | null = null;
     private readonly clients = new Set<ServerResponse>();
+    private readonly clientVersions = new WeakMap<ServerResponse, number>();
+    private snapshotVersion = 0;
+    private broadcastTimer: NodeJS.Timeout | null = null;
     private snapshot: HudSnapshot = {
         state: "booting",
         message: "Inicializando sistemas",
@@ -64,16 +67,27 @@ export class HudServer {
             const server = createServer((request, response) => {
                 const requestUrl = new URL(request.url ?? "/", this.url());
 
+                // Transcripts are local/private: a third-party page cannot read
+                // this loopback API through a permissive CORS response.
+                if (request.headers.origin && request.headers.origin !== this.url()) {
+                    response.writeHead(403);
+                    response.end("Origin not allowed");
+                    return;
+                }
+
                 if (requestUrl.pathname === "/api/events") {
                     response.writeHead(200, {
                         "Content-Type": "text/event-stream",
                         "Cache-Control": "no-cache",
                         Connection: "keep-alive",
-                        "Access-Control-Allow-Origin": "*",
+                        "X-Content-Type-Options": "nosniff",
                     });
                     response.write(`data: ${JSON.stringify(this.snapshot)}\n\n`);
+                    this.clientVersions.set(response, this.snapshotVersion);
                     this.clients.add(response);
                     request.on("close", () => this.clients.delete(response));
+                    response.on("error", () => this.clients.delete(response));
+                    response.on("drain", () => this.writeSnapshot(response));
                     return;
                 }
 
@@ -97,7 +111,9 @@ export class HudServer {
                 response.writeHead(200, {
                     "Content-Type": mimeTypes[path.extname(filePath)] ?? "application/octet-stream",
                 });
-                createReadStream(filePath).pipe(response);
+                const stream = createReadStream(filePath);
+                stream.on("error", () => response.destroy());
+                stream.pipe(response);
             });
 
             let remainingPorts = 10;
@@ -125,14 +141,34 @@ export class HudServer {
 
     update(update: Partial<HudSnapshot>): void {
         this.snapshot = { ...this.snapshot, ...update };
-        const payload = `data: ${JSON.stringify(this.snapshot)}\n\n`;
+        this.snapshotVersion += 1;
+        if (this.broadcastTimer || this.clients.size === 0) return;
 
-        for (const client of this.clients) {
-            client.write(payload);
+        // Streaming token bursts only need the latest snapshot per frame batch.
+        // /api/status and new SSE clients still receive the latest state now.
+        this.broadcastTimer = setTimeout(() => {
+            this.broadcastTimer = null;
+            for (const client of this.clients) this.writeSnapshot(client);
+        }, 40);
+        this.broadcastTimer.unref();
+    }
+
+    private writeSnapshot(client: ServerResponse): void {
+        if (client.destroyed || client.writableEnded) {
+            this.clients.delete(client);
+            return;
         }
+        // Do not accumulate every intermediate token for a slow/hidden client.
+        // Its drain callback will send the latest complete snapshot instead.
+        if (client.writableNeedDrain) return;
+        if (this.clientVersions.get(client) === this.snapshotVersion) return;
+        this.clientVersions.set(client, this.snapshotVersion);
+        client.write(`data: ${JSON.stringify(this.snapshot)}\n\n`);
     }
 
     stop(): void {
+        if (this.broadcastTimer) clearTimeout(this.broadcastTimer);
+        this.broadcastTimer = null;
         for (const client of this.clients) {
             client.end();
         }

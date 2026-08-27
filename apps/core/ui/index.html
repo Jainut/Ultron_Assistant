@@ -6,61 +6,70 @@
     <title>ULTRON // Neural Interface</title>
     <link rel="stylesheet" href="/styles.css">
 </head>
-<body data-state="booting">
-    <canvas id="network" aria-hidden="true"></canvas>
-    <div class="scanlines" aria-hidden="true"></div>
+<body data-state="booting" data-connected="false">
+    <div class="ambient-field" aria-hidden="true"></div>
 
     <header class="topbar">
-        <div class="brand"><span class="brand-mark">U</span> ULTRON CORE</div>
-        <div class="system-line"><span class="pulse-dot"></span><span id="connection">LINK LOCAL</span></div>
-        <div id="clock">00:00:00</div>
+        <div class="brand"><span class="brand-mark" aria-hidden="true">U</span><div>ULTRON<span>PERSONAL INTELLIGENCE</span></div></div>
+        <div class="system-line"><span class="pulse-dot"></span><span id="connection" role="status">CONECTANDO</span><span class="link-label">LOCAL LINK</span></div>
+        <div class="header-end"><span id="date"></span><time id="clock">--:--:--</time></div>
     </header>
 
+    <div class="workspace-heading"><span>NEURAL INTERFACE</span><span>ASSISTENTE PESSOAL <i>/</i> PT-BR</span></div>
+
     <main class="layout">
-        <aside class="telemetry panel">
-            <p class="eyebrow">TELEMETRIA</p>
-            <div class="metric"><span>LLM</span><strong>OLLAMA</strong></div>
-            <div class="metric"><span>LINGUAGEM</span><strong>PT-BR</strong></div>
-            <div class="metric"><span>REDE</span><strong>LOCAL</strong></div>
-            <div class="metric"><span>PROTOCOLO</span><strong>NEURAL/01</strong></div>
-            <div class="wave-bars" aria-hidden="true"></div>
+        <aside class="telemetry panel" aria-labelledby="telemetry-title">
+            <div class="section-heading"><span class="section-index">01</span><h2 id="telemetry-title">TELEMETRIA</h2></div>
+            <p class="panel-caption">Última interação</p>
+            <div class="primary-metric"><strong id="action-latency">—</strong><span>até iniciar a ação</span></div>
+            <dl class="metrics">
+                <div><dt>Transcrição</dt><dd id="metric-transcription">—</dd></div>
+                <div><dt>Intenção</dt><dd id="metric-intent">—</dd></div>
+                <div><dt>Execução da tool</dt><dd id="metric-tool">—</dd></div>
+                <div><dt>Até começar a falar</dt><dd id="metric-voice">—</dd></div>
+            </dl>
+            <p class="metric-note" id="metric-note">Aguardando primeira medição.</p>
+            <div class="pipeline" aria-label="Etapas da conversa">
+                <div data-phase="input"><i></i><span>OUVIR</span></div><b aria-hidden="true"></b>
+                <div data-phase="intent"><i></i><span>ENTENDER</span></div><b aria-hidden="true"></b>
+                <div data-phase="output"><i></i><span>RESPONDER</span></div>
+            </div>
         </aside>
 
         <section class="core-stage" aria-label="Estado do Ultron">
-            <div class="orbit orbit-outer"><i></i><i></i><i></i></div>
-            <div class="orbit orbit-mid"><i></i><i></i></div>
-            <div class="orbit orbit-inner"></div>
-            <div class="ticks"></div>
+            <div class="stage-coordinate coordinate-top" aria-hidden="true">U / NEURAL CORE</div>
+            <div class="sphere-halo" aria-hidden="true"></div>
+            <canvas id="network" aria-hidden="true"></canvas>
+            <div class="stage-crosshair crosshair-left" aria-hidden="true"></div>
+            <div class="stage-crosshair crosshair-right" aria-hidden="true"></div>
             <div class="core">
-                <div class="core-glow"></div>
                 <span class="core-label">ULTRON</span>
-                <strong id="state">BOOTING</strong>
-                <small id="message">INICIALIZANDO SISTEMAS</small>
+                <div class="core-state"><span></span><strong id="state">INICIALIZANDO</strong></div>
             </div>
-            <div class="status-chip"><span></span> SISTEMA OPERACIONAL</div>
+            <div class="stage-status"><p id="message" role="status">Inicializando sistemas</p><span>VOICE · CONTEXT · AUTOMATION</span></div>
         </section>
 
-        <aside class="memory panel">
-            <p class="eyebrow">AUTOMAÇÃO</p>
-            <div class="brain-count"><strong>LOCAL</strong><span>HUB<br>RESIDENCIAL</span></div>
-            <div class="node-list">
-                <div><i></i>LÂMPADA TUYA</div>
-                <div><i></i>TELEVISÃO</div>
-                <div><i></i>HOME ASSISTANT</div>
-                <div><i></i>WHISPER</div>
-                <div><i></i>OLLAMA</div>
+        <aside class="memory panel" aria-labelledby="systems-title">
+            <div class="section-heading"><span class="section-index">02</span><h2 id="systems-title">INTEGRAÇÕES</h2></div>
+            <p class="panel-caption">Seu ambiente, conectado.</p>
+            <div class="integration-group"><span>INTELIGÊNCIA & VOZ</span><p>Ollama <i>/</i> Whisper <i>/</i> Kokoro</p></div>
+            <div class="integration-group"><span>AUTOMAÇÃO RESIDENCIAL</span><p>Lâmpada Tuya <i>/</i> TV<br>Home Assistant</p></div>
+            <p class="integration-note">Disponibilidade conforme configuração.</p>
+            <div class="render-control">
+                <button id="performance-mode" type="button" aria-pressed="false"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M9 1 3 9h4l-1 6 7-9H9Z"/></svg><span>Modo desempenho</span><i aria-hidden="true"></i></button>
+                <span id="render-detail">Visualização adaptativa</span>
             </div>
         </aside>
     </main>
 
-    <footer class="conversation">
+    <footer class="conversation" aria-label="Conversa atual">
         <div class="conversation-copy">
-            <span class="label">ENTRADA</span>
+            <div class="conversation-heading"><span class="label">VOCÊ</span><span class="conversation-meta">ENTRADA DE VOZ</span></div>
             <p id="transcript">Aguardando comando de voz...</p>
         </div>
         <div class="response-copy">
-            <span class="label">RESPOSTA</span>
-            <p id="response">Sistemas entrando em operação.</p>
+            <div class="conversation-heading"><span class="label">ULTRON</span><span class="conversation-meta">RESPOSTA</span></div>
+            <p id="response" aria-live="polite" aria-atomic="true">Sistemas entrando em operação.</p>
         </div>
     </footer>
 

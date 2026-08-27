@@ -192,6 +192,9 @@ alterações; consultas de status sempre leem o estado real.
 
 ## Serviços esperados
 
+A interface possui uma [esfera neural azul e modo desempenho](docs/HUD_NEURAL_BLUE.md),
+com métricas reais da última interação e transmissão SSE agrupada.
+
 O fechamento da etapa de voz, os comandos de calibração e as limitações dos
 testes físicos estão em [P2: startup e calibração](docs/P2_VOICE_STARTUP_AND_CALIBRATION.md).
 
