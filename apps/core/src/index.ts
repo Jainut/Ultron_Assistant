@@ -1,4 +1,10 @@
 import { randomUUID } from "node:crypto";
+import { isMainEntry, runCli } from "./cli.ts";
+import type { InstanceControl } from "./system/instance-control.ts";
+import type { RemoteCommand } from "./system/remote-command-inbox.ts";
+import { applicationResolver } from "./system/application-resolver.ts";
+import { fileSystem } from "./filesystem/file-system-service.ts";
+import { androidTvRemote } from "./automation/android-tv-remote.ts";
 
 import { OllamaService, parseDirectAutomationCommand } from "./ai/ollama.service.ts";
 import { TextToSpeechService } from "./speech/text-to-speech.ts";
@@ -13,7 +19,7 @@ import {
     stopAutomaticDeviceDiscovery,
 } from "./automation/device-discovery.ts";
 import { FastIntentRouter } from "./intent/fast-intent-router.ts";
-import { stopLightService } from "../tools/light.tool.ts";
+import { startLightService, stopLightService } from "../tools/light.tool.ts";
 import {
     registerToolActions,
     startAutomationRuntime,
@@ -38,6 +44,9 @@ const hud = new HudServer();
 const fastRouter = new FastIntentRouter(parseDirectAutomationCommand);
 const lifecycleController = new AbortController();
 const conversationId = randomUUID();
+let instanceControl: InstanceControl | null = null;
+let runtimeStarted = false;
+let nextRemoteCommandPromise: Promise<RemoteCommand> | null = null;
 
 
 type AssistantMode =
@@ -59,6 +68,22 @@ const attemptedNotificationIds = new Set<string>();
 let activeNotificationTrust: NotificationTrust | null = null;
 let interruptedUntrustedNotification = false;
 let activeNotificationDeliveryFailed = false;
+
+function ensureRemoteCommandWait(): Promise<RemoteCommand> {
+    if (!nextRemoteCommandPromise) {
+        if (!instanceControl) throw new Error("O controle de instância ainda não foi adquirido.");
+        nextRemoteCommandPromise = instanceControl.nextCommand();
+    }
+    return nextRemoteCommandPromise;
+}
+
+function interruptForRemoteCommand(): void {
+    // Typed input is an explicit user request, never acoustic echo or a tool bypass.
+    currentTurnInterrupted = true;
+    currentTurnController?.abort(new DOMException("Novo comando recebido pelo terminal", "AbortError"));
+    ai.abortCurrentResponse();
+    void speechQueue.interrupt();
+}
 
 function ensureNotificationWait(): Promise<NotificationRecord> {
     if (notificationDeliveryDisabled) {
@@ -322,6 +347,7 @@ function looksLikePlaybackEcho(command: string): boolean {
 async function speak(
     text: string,
 ): Promise<void> {
+    currentTurnController?.signal.throwIfAborted();
     currentTurnInterrupted = false;
     lastAssistantSpeech = text;
 
@@ -340,7 +366,14 @@ function shutdownServices(): Promise<void> {
     if (shutdownPromise) return shutdownPromise;
 
     shutdownPromise = (async () => {
+        instanceControl?.update({ phase: "stopping", detail: "Encerrando serviços e persistindo automações." });
         lifecycleController.abort(new DOMException("Ultron encerrado", "AbortError"));
+        currentTurnInterrupted = true;
+        currentTurnController?.abort(new DOMException("Ultron encerrado", "AbortError"));
+        ai.abortCurrentResponse();
+        const interrupted = speechQueue.interrupt().catch(error => {
+            debugLog("[SHUTDOWN] Falha ao limpar fila de voz:", error);
+        });
 
         const stops: Array<() => void> = [
             () => stt.stop(),
@@ -348,6 +381,9 @@ function shutdownServices(): Promise<void> {
             () => hud.stop(),
             () => stopAutomaticDeviceDiscovery(),
             () => stopLightService(),
+            () => androidTvRemote.stop(),
+            () => applicationResolver.stop(),
+            () => fileSystem.stop(),
         ];
         for (const stop of stops) {
             try {
@@ -362,6 +398,9 @@ function shutdownServices(): Promise<void> {
         } catch (error) {
             debugLog("[SHUTDOWN] Falha ao persistir Automation Core:", error);
         }
+        await interrupted;
+        // Release the atomic singleton only after service teardown was requested.
+        await instanceControl?.close();
     })();
 
     return shutdownPromise;
@@ -373,7 +412,10 @@ async function main(): Promise<void> {
     );
 
     try {
+        lifecycleController.signal.throwIfAborted();
         await hud.start();
+        instanceControl?.update({ hudUrl: hud.url() });
+        lifecycleController.signal.throwIfAborted();
         console.log(`Interface: ${hud.url()}`);
         hud.openInBrowser();
 
@@ -400,20 +442,24 @@ async function main(): Promise<void> {
                 },
             ),
         ]);
+        lifecycleController.signal.throwIfAborted();
 
         // Registra as tools determinísticas antes de aceitar o primeiro comando.
         // O carregamento dos jobs persistidos continua em background.
         registerToolActions();
         fastRouter.start();
+        instanceControl?.update({ phase: "ready", detail: "Voz e tools prontas." });
 
         console.log(
             "\nUltron iniciado."
         );
 
         // Serviços de fundo só entram depois do caminho crítico de voz/tools.
+        startLightService();
         startAutomaticDeviceDiscovery();
         void startAutomationRuntime(lifecycleController.signal).catch(error => {
             debugLog("[AUTOMATION] Serviço degradado:", error);
+            instanceControl?.update({ phase: "degraded", detail: "Voz disponível; serviço de automações em modo degradado." });
         });
 
 
@@ -425,22 +471,24 @@ async function main(): Promise<void> {
         let assistantMode:
             AssistantMode = "active";
 
-        while (true) {
+        while (!lifecycleController.signal.aborted) {
             perf.start(
                 "STT listen",
             );
             const commandPromise =
                 nextCommandPromise
                 ?? ensureListening();
-            const requestId = nextCommandRequestId ?? randomUUID();
+            const voiceRequestId = nextCommandRequestId ?? randomUUID();
 
 
             let inputEvent:
                 | { kind: "command"; command: string }
+                | { kind: "remote-command"; remote: RemoteCommand }
                 | { kind: "notification"; notification: NotificationRecord }
                 | { kind: "notification-error"; error: unknown };
             try {
                 inputEvent = await Promise.race([
+                    ensureRemoteCommandWait().then(remote => ({ kind: "remote-command" as const, remote })),
                     commandPromise.then(command => ({ kind: "command" as const, command })),
                     ensureNotificationWait().then(
                         notification => ({ kind: "notification" as const, notification }),
@@ -448,7 +496,7 @@ async function main(): Promise<void> {
                     ),
                 ]);
             } catch (error) {
-                finishRequestTimeline(requestId);
+                finishRequestTimeline(voiceRequestId);
                 nextCommandPromise = null;
                 nextCommandRequestId = null;
                 throw error;
@@ -527,9 +575,18 @@ async function main(): Promise<void> {
                 continue;
             }
 
-            const command = inputEvent.command;
-            nextCommandPromise = null;
-            nextCommandRequestId = null;
+            const remoteInput = inputEvent.kind === "remote-command";
+            const command = inputEvent.kind === "remote-command" ? inputEvent.remote.text : inputEvent.command;
+            const requestId = inputEvent.kind === "remote-command" ? inputEvent.remote.requestId : voiceRequestId;
+            if (remoteInput) {
+                nextRemoteCommandPromise = null;
+                requestPerformanceTimelines.start({ requestId, conversationId });
+                // Keep the already armed STT promise: never open a second microphone/listen.
+                if (!isSleepCommand(command)) assistantMode = "active";
+            } else {
+                nextCommandPromise = null;
+                nextCommandRequestId = null;
+            }
             currentRequestId = requestId;
 
             hud.update({
@@ -544,7 +601,7 @@ async function main(): Promise<void> {
             );
 
             if (
-                interruptionDuringPlayback
+                !remoteInput && interruptionDuringPlayback
                 && interruptedUntrustedNotification
             ) {
                 interruptionDuringPlayback = false;
@@ -560,7 +617,7 @@ async function main(): Promise<void> {
             }
 
             if (
-                interruptionDuringPlayback
+                !remoteInput && interruptionDuringPlayback
                 && looksLikePlaybackEcho(command)
             ) {
                 interruptionDuringPlayback = false;
@@ -574,8 +631,10 @@ async function main(): Promise<void> {
                 continue;
             }
 
-            interruptionDuringPlayback = false;
-            interruptedUntrustedNotification = false;
+            if (!remoteInput) {
+                interruptionDuringPlayback = false;
+                interruptedUntrustedNotification = false;
+            }
 
             perf.startRequest();
             currentTurnController = new AbortController();
@@ -734,6 +793,7 @@ async function main(): Promise<void> {
                         conversationId,
                     },
                 );
+                turnSignal.throwIfAborted();
 
                 if (fastResult) {
                     const response = fastResult.needsInterpretation
@@ -747,6 +807,7 @@ async function main(): Promise<void> {
                             turnSignal,
                         )
                         : fastResult.response;
+                    turnSignal.throwIfAborted();
                     console.log(`Ultron> ${response}`);
                     if (!fastResult.needsInterpretation) {
                         ai.rememberExchange(command, response);
@@ -783,6 +844,7 @@ async function main(): Promise<void> {
                             turnSignal,
                             { requestId, conversationId },
                         );
+                    turnSignal.throwIfAborted();
 
 
                     perf.end(
@@ -971,21 +1033,32 @@ async function main(): Promise<void> {
     }
 }
 
-process.once("SIGINT", () => {
-    void shutdownServices().finally(() => process.exit(0));
-});
+export async function startUltron(owner: InstanceControl, initialCommand?: string): Promise<void> {
+    if (runtimeStarted) throw new Error("O runtime Ultron já foi iniciado neste processo.");
+    runtimeStarted = true;
+    instanceControl = owner;
+    let explicitlyStopped = false;
+    const exitAfterShutdown = (): void => {
+        explicitlyStopped = true;
+        void shutdownServices().finally(() => process.exit(0));
+    };
+    owner.onShutdown(exitAfterShutdown);
+    owner.onCommandAccepted(interruptForRemoteCommand);
+    if (initialCommand) owner.acceptInitialCommand(initialCommand);
+    process.once("SIGINT", exitAfterShutdown);
+    process.once("SIGTERM", exitAfterShutdown);
+    try {
+        await main();
+    } catch (error) {
+        if (!explicitlyStopped) throw error;
+    } finally {
+        process.removeListener("SIGINT", exitAfterShutdown);
+        process.removeListener("SIGTERM", exitAfterShutdown);
+    }
+}
 
-process.once("SIGTERM", () => {
-    void shutdownServices().finally(() => process.exit(0));
-});
-
-main().catch(
-    (error: unknown) => {
-        console.error(
-            "FATAL ERROR:",
-            error,
-        );
-
-        process.exitCode = 1;
-    },
-);
+// Preserve npm run dev/start and direct index.js invocation. The CMD launcher
+// uses cli.js, so an existing instance never imports this voice/tool runtime.
+if (isMainEntry(import.meta.url)) {
+    void runCli().then(code => { process.exitCode = code; });
+}

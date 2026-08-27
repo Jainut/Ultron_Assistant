@@ -19,6 +19,21 @@ npm link
 ultron
 ```
 
+O comando reutiliza a instância aberta. Também é possível controlar o mesmo
+processo sem carregar os modelos novamente:
+
+```cmd
+ultron status
+ultron "liga a luz"
+ultron hud
+ultron stop
+ultron restart
+```
+
+Texto enviado pelo CMD usa o mesmo contexto e as mesmas confirmações da voz.
+O recebimento do comando não significa que a ação foi concluída. Detalhes e
+limites estão em [P4: instância única e CLI](docs/P4_INSTANCE_CLI.md).
+
 O HUD abre em `http://127.0.0.1:8787`. Para testar somente a interface:
 
 ```cmd
@@ -139,6 +154,11 @@ lista o que tem aqui
 Aplicativos são indexados em background pelo Menu Iniciar, PATH, App Paths do
 Registry, Microsoft Store e Program Files. As aliases antigas em
 `apps/core/config/config.ts` continuam válidas e têm precedência.
+
+Os índices de aplicativos e arquivos agora são persistidos em `data/indexes/`,
+com validade por fonte e atualização incremental. Um cache válido após reiniciar
+não exige nova varredura; candidatos removidos são invalidados antes da abertura.
+Veja [P4: índices persistentes](docs/P4_INDEXES.md).
 
 Arquivos e pastas são procurados em Desktop, Documents, Downloads, Projects,
 GitHub e OneDrive. Roots extras podem ser informados em `ULTRON_SEARCH_ROOTS`,

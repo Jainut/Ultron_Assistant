@@ -4,7 +4,7 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 
 const projectRoot = path.resolve(__dirname, "..");
-const entryPoint = path.join(projectRoot, "apps", "core", "dist", "src", "index.js");
+const entryPoint = path.join(projectRoot, "apps", "core", "dist", "src", "cli.js");
 const environmentFile = path.join(projectRoot, "ultron.env.cmd");
 
 if (!existsSync(entryPoint)) {
@@ -14,7 +14,7 @@ if (!existsSync(entryPoint)) {
 
 const childEnvironment = { ...process.env, ULTRON_ROOT: projectRoot };
 
-if (existsSync(environmentFile)) {
+if (existsSync(environmentFile) && process.env.ULTRON_ENV_LOADED !== "1") {
     for (const line of readFileSync(environmentFile, "utf8").split(/\r?\n/)) {
         const setting = line.match(/^\s*set\s+"([^"=]+)=(.*)"\s*$/i);
         if (!setting) continue;
