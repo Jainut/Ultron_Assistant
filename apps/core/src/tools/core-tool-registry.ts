@@ -47,6 +47,7 @@ interface AutomationPayload {
     fallback_error?: string;
     confirmed?: boolean;
     optimistic?: boolean;
+    status?: ActionStatus;
     state?: Record<string, unknown>;
     [key: string]: unknown;
 }
@@ -61,17 +62,30 @@ function parsePayload(raw: string): AutomationPayload {
 
 function actionStatus(payload: AutomationPayload, action: string): ActionStatus {
     if (payload.success === false) return "failed";
-    if (action === "status" || action === "pair") return "confirmed";
+    const explicitStatus = payload.status ?? payload.state?.status;
+    if (
+        explicitStatus === "confirmed" || explicitStatus === "accepted"
+        || explicitStatus === "optimistic" || explicitStatus === "unknown"
+        || explicitStatus === "failed"
+    ) return explicitStatus;
     if (payload.confirmed === true || payload.state?.confirmed === true) {
         return "confirmed";
     }
     if (payload.optimistic === true || payload.state?.optimistic === true) {
         return "optimistic";
     }
+    if (action === "pair") {
+        if (payload.state?.paired === true) return "confirmed";
+        return payload.state?.pairingRequired === true ? "accepted" : "unknown";
+    }
+    if (action === "status") {
+        // A status request without readback metadata is not itself evidence.
+        return "unknown";
+    }
     return "accepted";
 }
 
-function automationResult(raw: string, action: string): ToolResult<AutomationPayload> {
+export function automationResult(raw: string, action: string): ToolResult<AutomationPayload> {
     const payload = parsePayload(raw);
     const status = actionStatus(payload, action);
     const message = payload.message

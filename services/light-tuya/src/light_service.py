@@ -145,6 +145,8 @@ def cloud_fallback(arguments: list[str]) -> dict:
             time.sleep(0.5)
 
         status_result = result if action == "status" else cloud.getstatus(device_id)
+        if not isinstance(status_result, dict) or not status_result.get("success"):
+            raise RuntimeError("A Tuya não retornou uma leitura válida do estado.")
         state = {
             item["code"]: item.get("value")
             for item in status_result.get("result", [])
@@ -158,12 +160,18 @@ def cloud_fallback(arguments: list[str]) -> dict:
     if not fast_confirmation and action == "off" and state.get("switch_led") is not False:
         raise RuntimeError("A nuvem Tuya não confirmou que a lâmpada desligou.")
 
+    confirmed = not fast_confirmation and (
+        isinstance(state.get("switch_led"), bool) if action == "status"
+        else all(state.get(code) == value for code, value in optimistic_updates.items())
+    )
     return {
         "success": True,
         "action": action,
         "transport": "tuya_cloud",
-        "confirmed": not fast_confirmation,
+        "confirmed": confirmed,
         "optimistic": fast_confirmation,
+        "status": "confirmed" if confirmed else "optimistic" if fast_confirmation else "unknown",
+        "message": "Estado real ainda não confirmado." if not confirmed and not fast_confirmation else None,
         "state": {
             "is_on": state.get("switch_led"),
             "mode": state.get("work_mode"),
@@ -268,19 +276,20 @@ def load_device() -> dict:
     )
 
 
-def get_bulb() -> tinytuya.BulbDevice:
+def get_bulb(probe: bool = True) -> tinytuya.BulbDevice:
     device = load_device()
 
-    try:
-        connection = socket.create_connection(
-            (device["ip"], 6668),
-            timeout=0.6,
-        )
-        connection.close()
-    except OSError as error:
-        raise ConnectionError(
-            f"Dispositivo Tuya local indisponível em {device['ip']}:6668"
-        ) from error
+    if probe:
+        try:
+            connection = socket.create_connection(
+                (device["ip"], 6668),
+                timeout=0.6,
+            )
+            connection.close()
+        except OSError as error:
+            raise ConnectionError(
+                "Dispositivo Tuya local indisponível."
+            ) from error
 
     bulb = tinytuya.BulbDevice(
         device["id"],

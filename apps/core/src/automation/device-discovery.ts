@@ -1,13 +1,16 @@
-import { execFile, spawn } from "node:child_process";
+import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import dgram from "node:dgram";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { networkInterfaces } from "node:os";
 import path from "node:path";
 
-import { runtimeConfig, servicePath } from "../config/runtime.ts";
+import { runtimeConfig } from "../config/runtime.ts";
 import { debugLog } from "../utils/debug.ts";
+import { perf } from "../utils/performance.ts";
 import { androidTvRemote, type AndroidTvAction } from "./android-tv-remote.ts";
+import { tuyaHomeClient } from "./tuya-cloud-client.ts";
 
 export type DiscoveredProtocol =
     | "roku"
@@ -43,6 +46,23 @@ export interface DiscoveredDevice {
     authToken?: string;
     deviceId?: string;
     lastSeen: number;
+    lastDiscovered?: number;
+    lastReachable?: number;
+    lastConfirmed?: number;
+    online?: boolean | null;
+    paired?: boolean | null;
+    /** Historical successful control; merely identifying a protocol is not proof. */
+    controllable?: boolean;
+    addressConflict?: boolean;
+    capabilities?: DeviceCapabilities;
+}
+
+export interface DeviceCapabilities {
+    /** Actions supported by this adapter, not a claim of device authorization. */
+    actions: string[];
+    powerMode: "discrete" | "toggle" | "unknown";
+    requiresPairing: boolean;
+    generation?: number;
 }
 
 interface SsdpRecord {
@@ -67,6 +87,174 @@ const registryPath = path.join(
 
 const SCAN_INTERVAL_MS = 5 * 60_000;
 const CACHE_MAX_AGE_MS = 30 * 24 * 60 * 60_000;
+const REACHABILITY_MAX_AGE_MS = 60_000;
+const MAX_INVENTORY_DEVICES = 1_024;
+const PROTOCOLS: DiscoveredProtocol[] = ["roku", "samsung", "lg-webos", "android-tv", "google-cast", "tuya-cloud", "kasa", "shelly", "wled", "upnp", "network"];
+const KINDS: DiscoveredDeviceKind[] = ["television", "media_player", "light", "switch", "unknown"];
+
+function requestSignal(signal: AbortSignal | undefined, timeoutMs: number): AbortSignal {
+    return signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs);
+}
+
+function waitWithSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+    if (!signal) return promise;
+    return new Promise((resolve, reject) => {
+        const abort = (): void => {
+            signal.removeEventListener("abort", abort);
+            reject(signal.reason ?? new DOMException("Operação cancelada.", "AbortError"));
+        };
+        promise.then(value => {
+            signal.removeEventListener("abort", abort);
+            resolve(value);
+        }, error => {
+            signal.removeEventListener("abort", abort);
+            reject(error);
+        });
+        if (signal.aborted) abort();
+        else signal.addEventListener("abort", abort, { once: true });
+    });
+}
+
+export async function mapDiscoveryLimited<T, R>(
+    values: readonly T[], concurrency: number,
+    task: (value: T) => Promise<R>, signal?: AbortSignal,
+): Promise<R[]> {
+    const results: R[] = new Array(values.length);
+    let cursor = 0;
+    await Promise.all(Array.from({ length: Math.min(values.length, Math.max(1, concurrency)) }, async () => {
+        while (cursor < values.length) {
+            signal?.throwIfAborted();
+            const index = cursor++;
+            results[index] = await task(values[index]);
+        }
+    }));
+    return results;
+}
+
+export function deviceCapabilities(device: Pick<DiscoveredDevice, "protocol" | "capabilities">): DeviceCapabilities {
+    const power = ["status", "on", "off", "toggle"];
+    const remote = [...power, "volume_up", "volume_down", "mute", "unmute", "play", "pause", "stop", "home", "back", "up", "down", "left", "right", "select", "channel_up", "channel_down", "next", "previous"];
+    const actions = device.protocol === "android-tv" || device.protocol === "samsung"
+        ? [...remote, "menu", "input"]
+        : device.protocol === "roku" ? remote
+            : ["kasa", "shelly", "wled", "tuya-cloud"].includes(device.protocol) ? power : [];
+    return {
+        actions,
+        powerMode: device.protocol === "android-tv" ? "toggle" : actions.length ? "discrete" : "unknown",
+        requiresPairing: ["android-tv", "samsung", "lg-webos"].includes(device.protocol),
+        generation: device.protocol === "shelly" && Number.isInteger(device.capabilities?.generation)
+            ? device.capabilities?.generation : undefined,
+    };
+}
+
+function stableId(device: DiscoveredDevice): string | undefined {
+    const id = device.id.trim().toLowerCase();
+    if (!id || id.startsWith("network:") || /\d{1,3}(?:\.\d{1,3}){3}/.test(id)) return undefined;
+    return id.startsWith("uuid:") ? id.split("::")[0] : id;
+}
+
+export function sameDeviceIdentity(left: DiscoveredDevice, right: DiscoveredDevice): boolean {
+    const leftMac = normalizeMac(left.mac), rightMac = normalizeMac(right.mac);
+    if (leftMac && rightMac && leftMac !== rightMac) return false;
+    if (left.deviceId && right.deviceId && left.deviceId !== right.deviceId) return false;
+    const leftId = stableId(left), rightId = stableId(right);
+    if (left.protocol === right.protocol && leftId && rightId && leftId !== rightId) return false;
+    return Boolean((leftMac && rightMac && leftMac === rightMac)
+        || (left.deviceId && left.deviceId === right.deviceId)
+        || (leftId && leftId === rightId));
+}
+
+function inventoryKey(device: DiscoveredDevice): string {
+    return device.deviceId ? `device:${device.protocol}:${device.deviceId}`
+        : normalizeMac(device.mac) ? `mac:${normalizeMac(device.mac)}`
+            : stableId(device) ?? `endpoint:${device.protocol}:${device.ip}`;
+}
+
+function validTimestamp(value: unknown, now: number): number | undefined {
+    return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= now + 60_000 ? value : undefined;
+}
+
+export function parseDeviceInventory(raw: unknown, now = Date.now()): DiscoveredDevice[] {
+    const entries = Array.isArray(raw) ? raw
+        : raw && typeof raw === "object" && "version" in raw && raw.version === 2 && "devices" in raw && Array.isArray(raw.devices)
+            ? raw.devices : [];
+    return entries.slice(0, MAX_INVENTORY_DEVICES).flatMap((entry: unknown) => {
+        if (!entry || typeof entry !== "object") return [];
+        const item = entry as DiscoveredDevice;
+        if (typeof item.id !== "string" || typeof item.name !== "string" || typeof item.ip !== "string"
+            || !PROTOCOLS.includes(item.protocol) || !KINDS.includes(item.kind)) return [];
+        if (!isPrivateIpv4(item.ip) && !(item.protocol === "tuya-cloud" && /^tuya:[\w-]+$/.test(item.ip))) return [];
+        const lastSeen = validTimestamp(item.lastSeen, now);
+        if (lastSeen === undefined || lastSeen < now - CACHE_MAX_AGE_MS) return [];
+        const lastReachable = validTimestamp(item.lastReachable, now);
+        return [{
+            ...item,
+            mac: normalizeMac(item.mac),
+            deviceId: typeof item.deviceId === "string" ? item.deviceId : undefined,
+            manufacturer: typeof item.manufacturer === "string" ? item.manufacturer : undefined,
+            model: typeof item.model === "string" ? item.model : undefined,
+            authToken: typeof item.authToken === "string" ? item.authToken : undefined,
+            lastSeen,
+            lastDiscovered: validTimestamp(item.lastDiscovered, now) ?? lastSeen,
+            lastReachable,
+            lastConfirmed: validTimestamp(item.lastConfirmed, now),
+            online: item.online === false ? false : lastReachable !== undefined && now - lastReachable <= REACHABILITY_MAX_AGE_MS && item.online === true ? true : null,
+            paired: typeof item.paired === "boolean" ? item.paired : null,
+            controllable: item.controllable === true,
+            addressConflict: item.addressConflict === true,
+            capabilities: deviceCapabilities(item),
+        }];
+    });
+}
+
+export function mergeDeviceInventory(
+    existingDevices: readonly DiscoveredDevice[], found: readonly DiscoveredDevice[], now = Date.now(),
+): DiscoveredDevice[] {
+    const merged = new Map(existingDevices.filter(device => device.lastSeen >= now - CACHE_MAX_AGE_MS).map(device => [inventoryKey(device), { ...device }]));
+    for (const discovery of found) {
+        const incoming = { ...discovery, mac: normalizeMac(discovery.mac), authToken: undefined };
+        const prior = [...merged.values()].find(device => sameDeviceIdentity(device, incoming));
+        const preferred = prior && deviceScore(prior) > deviceScore(incoming) ? prior : incoming;
+        const sameProtocol = prior?.protocol === preferred.protocol;
+        const device: DiscoveredDevice = {
+            ...prior, ...preferred,
+            ip: incoming.ip,
+            mac: incoming.mac ?? prior?.mac,
+            broadcast: incoming.broadcast ?? (prior?.ip === incoming.ip ? prior.broadcast : undefined),
+            authToken: sameProtocol ? prior?.authToken : undefined,
+            lastSeen: incoming.lastSeen,
+            lastDiscovered: incoming.lastDiscovered ?? incoming.lastSeen,
+            lastReachable: incoming.lastReachable ?? prior?.lastReachable,
+            lastConfirmed: sameProtocol ? prior?.lastConfirmed : undefined,
+            online: incoming.online ?? prior?.online ?? null,
+            paired: sameProtocol ? prior?.paired ?? null : null,
+            controllable: sameProtocol && prior?.controllable === true,
+            addressConflict: false,
+        };
+        device.capabilities = deviceCapabilities(device);
+        if (prior) merged.delete(inventoryKey(prior));
+        for (const [key, previous] of merged) {
+            if (previous.ip === incoming.ip && !sameDeviceIdentity(previous, incoming)) {
+                if (key === inventoryKey(incoming)) merged.delete(key);
+                else merged.set(key, { ...previous, online: false, addressConflict: true });
+            }
+        }
+        merged.set(inventoryKey(device), device);
+    }
+    return [...merged.values()].sort((left, right) => right.lastSeen - left.lastSeen).slice(0, MAX_INVENTORY_DEVICES);
+}
+
+export async function writeDeviceInventoryAtomic(file: string, inventory: unknown): Promise<void> {
+    await mkdir(path.dirname(file), { recursive: true });
+    const temporary = `${file}.${randomUUID()}.tmp`;
+    try {
+        await writeFile(temporary, `${JSON.stringify(inventory, null, 2)}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
+        await rename(temporary, file);
+    } catch (error) {
+        await unlink(temporary).catch(() => undefined);
+        throw error;
+    }
+}
 
 interface TuyaServiceResult {
     success?: boolean;
@@ -83,71 +271,20 @@ interface TuyaServiceResult {
     [key: string]: unknown;
 }
 
-function runTuyaHomeService(args: string[]): Promise<TuyaServiceResult> {
-    return new Promise((resolve, reject) => {
-        const serviceDir = servicePath("light-tuya");
-        const child = spawn(
-            path.join(serviceDir, ".venv", "Scripts", "python.exe"),
-            [path.join(serviceDir, "src", "home_service.py"), ...args],
-            { cwd: serviceDir, windowsHide: true },
-        );
-        let stdout = "";
-        let stderr = "";
-        let settled = false;
-        const finish = (error?: Error, result?: TuyaServiceResult): void => {
-            if (settled) {
-                return;
-            }
-
-            settled = true;
-            clearTimeout(timeout);
-            error ? reject(error) : resolve(result ?? {});
-        };
-        const timeout = setTimeout(() => {
-            child.kill();
-            finish(new Error("Timeout ao consultar dispositivos Tuya."));
-        }, 15_000);
-
-        child.stdout.on("data", chunk => {
-            stdout += chunk.toString();
-        });
-        child.stderr.on("data", chunk => {
-            stderr += chunk.toString();
-        });
-        child.once("error", error => {
-            finish(error);
-        });
-        child.once("close", code => {
-            if (settled) {
-                return;
-            }
-
-            try {
-                const result = JSON.parse(stdout.trim()) as TuyaServiceResult;
-
-                if (code !== 0 || result.success === false) {
-                    finish(new Error(result.error ?? stderr.trim() ?? "Falha no serviço Tuya."));
-                    return;
-                }
-
-                finish(undefined, result);
-            } catch (error) {
-                finish(error instanceof Error ? error : new Error(String(error)));
-            }
-        });
-    });
+async function runTuyaHomeService(args: string[], signal?: AbortSignal): Promise<TuyaServiceResult> {
+    return JSON.parse(await tuyaHomeClient.request(args, signal)) as TuyaServiceResult;
 }
 
 function normalizeMac(mac: string | undefined): string | undefined {
-    const compact = mac?.replace(/[^0-9a-f]/gi, "").toUpperCase();
+    const compact = typeof mac === "string" ? mac.replace(/[^0-9a-f]/gi, "").toUpperCase() : undefined;
     return compact?.length === 12
         ? compact.match(/.{2}/g)?.join(":")
         : undefined;
 }
 
-async function discoverTuyaCloudDevices(): Promise<DiscoveredDevice[]> {
+async function discoverTuyaCloudDevices(signal?: AbortSignal): Promise<DiscoveredDevice[]> {
     try {
-        const result = await runTuyaHomeService(["discover"]);
+        const result = await runTuyaHomeService(["discover"], signal);
 
         return (result.devices ?? []).map(device => ({
             id: `tuya-cloud:${device.id}`,
@@ -164,6 +301,7 @@ async function discoverTuyaCloudDevices(): Promise<DiscoveredDevice[]> {
             lastSeen: Date.now(),
         }));
     } catch (error) {
+        if (signal?.aborted) throw error;
         debugLog("[DISCOVERY] Tuya Cloud indisponível:", error);
         return [];
     }
@@ -181,7 +319,7 @@ function normalize(value: string): string {
 function isPrivateIpv4(ip: string): boolean {
     const parts = ip.split(".").map(Number);
 
-    if (parts.length !== 4 || parts.some(part => !Number.isInteger(part))) {
+    if (parts.length !== 4 || parts.some(part => !Number.isInteger(part) || part < 0 || part > 255)) {
         return false;
     }
 
@@ -254,13 +392,15 @@ export function parseArpTable(output: string): Map<string, string> {
     return entries;
 }
 
-function readArpTable(): Promise<Map<string, string>> {
-    return new Promise(resolve => {
+function readArpTable(signal?: AbortSignal): Promise<Map<string, string>> {
+    signal?.throwIfAborted();
+    return new Promise((resolve, reject) => {
         execFile(
             "arp.exe",
             ["-a"],
-            { windowsHide: true, timeout: 3_000 },
+            { windowsHide: true, timeout: 3_000, signal },
             (error, stdout) => {
+                if (signal?.aborted) { reject(signal.reason); return; }
                 resolve(error ? new Map() : parseArpTable(stdout));
             },
         );
@@ -301,32 +441,39 @@ function broadcastFor(ip: string): string | undefined {
     return undefined;
 }
 
-function discoverSsdp(timeoutMs = 1_200): Promise<SsdpRecord[]> {
-    return new Promise(resolve => {
+function discoverSsdp(timeoutMs = 1_200, signal?: AbortSignal): Promise<SsdpRecord[]> {
+    signal?.throwIfAborted();
+    return new Promise((resolve, reject) => {
         const socket = dgram.createSocket({ type: "udp4", reuseAddr: true });
         const records = new Map<string, SsdpRecord>();
         let settled = false;
+        let timer: NodeJS.Timeout | undefined;
+        const abort = (): void => finish(true);
 
-        const finish = (): void => {
+        const finish = (cancelled = false): void => {
             if (settled) {
                 return;
             }
 
             settled = true;
-            socket.close();
-            resolve([...records.values()]);
+            clearTimeout(timer);
+            signal?.removeEventListener("abort", abort);
+            try { socket.close(); } catch { /* A cancelled socket may not be bound yet. */ }
+            cancelled ? reject(signal?.reason) : resolve([...records.values()]);
         };
 
         socket.on("message", (message, remote) => {
             const record = parseSsdpResponse(message.toString("utf8"), remote.address);
 
-            if (record && isPrivateIpv4(record.ip)) {
+            if (record && isPrivateIpv4(record.ip) && records.size < 256) {
                 const key = record.headers.usn ?? `${record.ip}:${record.headers.location ?? ""}`;
                 records.set(key, record);
             }
         });
-        socket.once("error", finish);
+        socket.once("error", () => finish());
+        signal?.addEventListener("abort", abort, { once: true });
         socket.bind(0, () => {
+            if (settled) return;
             const request = Buffer.from([
                 "M-SEARCH * HTTP/1.1",
                 "HOST: 239.255.255.250:1900",
@@ -341,7 +488,7 @@ function discoverSsdp(timeoutMs = 1_200): Promise<SsdpRecord[]> {
             socket.send(request, 1900, "239.255.255.250");
         });
 
-        setTimeout(finish, timeoutMs);
+        timer = setTimeout(finish, timeoutMs);
     });
 }
 
@@ -488,7 +635,8 @@ export function parseMdnsResponse(packet: Buffer): MdnsRecord[] {
     return records;
 }
 
-function discoverMdns(timeoutMs = 1_000): Promise<DiscoveredDevice[]> {
+function discoverMdns(timeoutMs = 1_000, signal?: AbortSignal): Promise<DiscoveredDevice[]> {
+    signal?.throwIfAborted();
     const services = [
         "_googlecast._tcp.local",
         "_androidtvremote2._tcp.local",
@@ -502,18 +650,23 @@ function discoverMdns(timeoutMs = 1_000): Promise<DiscoveredDevice[]> {
         "_wled._tcp.local",
     ];
 
-    return new Promise(resolve => {
+    return new Promise((resolve, reject) => {
         const socket = dgram.createSocket({ type: "udp4", reuseAddr: true });
         const records: MdnsRecord[] = [];
         let settled = false;
+        let timer: NodeJS.Timeout | undefined;
+        const abort = (): void => finish(true);
 
-        const finish = (): void => {
+        const finish = (cancelled = false): void => {
             if (settled) {
                 return;
             }
 
             settled = true;
-            socket.close();
+            clearTimeout(timer);
+            signal?.removeEventListener("abort", abort);
+            try { socket.close(); } catch { /* Cancelled before bind. */ }
+            if (cancelled) { reject(signal?.reason); return; }
             const addresses = new Map(
                 records
                     .filter(record => record.type === 1 && record.ip)
@@ -555,15 +708,17 @@ function discoverMdns(timeoutMs = 1_000): Promise<DiscoveredDevice[]> {
         };
 
         socket.on("message", message => {
-            records.push(...parseMdnsResponse(message));
+            if (records.length < 4_096) records.push(...parseMdnsResponse(message).slice(0, 4_096 - records.length));
         });
-        socket.once("error", finish);
+        socket.once("error", () => finish());
+        signal?.addEventListener("abort", abort, { once: true });
         socket.bind(0, () => {
+            if (settled) return;
             for (const service of services) {
                 socket.send(mdnsQuery(service), 5353, "224.0.0.251");
             }
         });
-        setTimeout(finish, timeoutMs);
+        timer = setTimeout(finish, timeoutMs);
     });
 }
 
@@ -571,10 +726,18 @@ async function isPortOpen(
     ip: string,
     port: number,
     timeoutMs = 250,
+    signal?: AbortSignal,
 ): Promise<boolean> {
-    return new Promise(resolve => {
+    signal?.throwIfAborted();
+    return new Promise((resolve, reject) => {
         const socket = net.createConnection({ host: ip, port });
         let settled = false;
+        const abort = (): void => {
+            if (settled) return;
+            settled = true;
+            socket.destroy();
+            reject(signal?.reason);
+        };
 
         const finish = (open: boolean): void => {
             if (settled) {
@@ -582,6 +745,7 @@ async function isPortOpen(
             }
 
             settled = true;
+            signal?.removeEventListener("abort", abort);
             socket.destroy();
             resolve(open);
         };
@@ -589,17 +753,23 @@ async function isPortOpen(
         socket.once("connect", () => finish(true));
         socket.once("error", () => finish(false));
         socket.setTimeout(timeoutMs, () => finish(false));
+        signal?.addEventListener("abort", abort, { once: true });
     });
 }
 
-async function fetchText(url: string, timeoutMs = 900): Promise<string | null> {
+async function fetchText(url: string, timeoutMs = 900, signal?: AbortSignal): Promise<string | null> {
+    signal?.throwIfAborted();
     try {
         const response = await fetch(url, {
-            signal: AbortSignal.timeout(timeoutMs),
+            signal: requestSignal(signal, timeoutMs),
+            redirect: "error",
         });
 
-        return response.ok ? await response.text() : null;
-    } catch {
+        if (!response.ok || Number(response.headers.get("content-length")) > 1_048_576) return null;
+        const text = await response.text();
+        return text.length <= 1_048_576 ? text : null;
+    } catch (error) {
+        if (signal?.aborted) throw error;
         return null;
     }
 }
@@ -688,10 +858,17 @@ export function parseCastDeviceDescription(
     };
 }
 
-async function enrichSsdpRecord(record: SsdpRecord): Promise<DiscoveredDevice> {
+async function enrichSsdpRecord(record: SsdpRecord, signal?: AbortSignal): Promise<DiscoveredDevice> {
     const location = record.headers.location;
-    const description = location && /^https?:\/\//i.test(location)
-        ? await fetchText(location)
+    let safeLocation = false;
+    try {
+        const url = new URL(location);
+        safeLocation = ["http:", "https:"].includes(url.protocol)
+            && url.hostname === record.ip && isPrivateIpv4(url.hostname)
+            && !url.username && !url.password;
+    } catch { /* An untrusted advertisement is not an arbitrary fetch URL. */ }
+    const description = safeLocation
+        ? await fetchText(location, 900, signal)
         : null;
     const identity = [
         record.headers.server,
@@ -751,12 +928,15 @@ function kasaDecode(payload: Buffer): string {
 async function kasaRequest(
     ip: string,
     command: Record<string, unknown>,
+    signal?: AbortSignal,
 ): Promise<Record<string, unknown>> {
+    signal?.throwIfAborted();
     return new Promise((resolve, reject) => {
         const socket = net.createConnection({ host: ip, port: 9999 });
         const chunks: Buffer[] = [];
         let expectedLength: number | null = null;
         let settled = false;
+        const abort = (): void => finish(signal?.reason instanceof Error ? signal.reason : new DOMException("Operação cancelada.", "AbortError"));
 
         const finish = (error?: Error, result?: Record<string, unknown>): void => {
             if (settled) {
@@ -764,6 +944,7 @@ async function kasaRequest(
             }
 
             settled = true;
+            signal?.removeEventListener("abort", abort);
             socket.destroy();
             error ? reject(error) : resolve(result ?? {});
         };
@@ -777,6 +958,7 @@ async function kasaRequest(
 
             if (expectedLength === null && buffer.length >= 4) {
                 expectedLength = buffer.readUInt32BE(0);
+                if (expectedLength > 1_048_576) { finish(new Error("Resposta Kasa excedeu o limite permitido.")); return; }
             }
 
             if (expectedLength !== null && buffer.length >= expectedLength + 4) {
@@ -792,27 +974,21 @@ async function kasaRequest(
         });
         socket.once("error", error => finish(error));
         socket.setTimeout(1_200, () => finish(new Error("Timeout Kasa")));
+        signal?.addEventListener("abort", abort, { once: true });
     });
 }
 
 async function probeKnownProtocol(
     ip: string,
+    signal?: AbortSignal,
 ): Promise<DiscoveredDevice | null> {
     const [roku, samsung, samsungSecure, lg, lgSecure, androidRemote, cast, kasa, http] = await Promise.all([
-        isPortOpen(ip, 8060),
-        isPortOpen(ip, 8001),
-        isPortOpen(ip, 8002),
-        isPortOpen(ip, 3000),
-        isPortOpen(ip, 3001),
-        isPortOpen(ip, 6466),
-        isPortOpen(ip, 8008),
-        isPortOpen(ip, 9999),
-        isPortOpen(ip, 80),
+        ...[8060, 8001, 8002, 3000, 3001, 6466, 8008, 9999, 80].map(port => isPortOpen(ip, port, 250, signal)),
     ]);
     const now = Date.now();
 
     if (roku) {
-        const info = await fetchText(`http://${ip}:8060/query/device-info`);
+        const info = await fetchText(`http://${ip}:8060/query/device-info`, 900, signal);
         return {
             id: `roku:${ip}`,
             name: info ? xmlValue(info, "friendly-device-name") ?? "Roku TV" : "Roku TV",
@@ -826,7 +1002,7 @@ async function probeKnownProtocol(
     }
 
     if (samsung || samsungSecure) {
-        const infoText = await fetchText(`http://${ip}:8001/api/v2/`);
+        const infoText = await fetchText(`http://${ip}:8001/api/v2/`, 900, signal);
         let name = "Samsung TV";
         let model: string | undefined;
 
@@ -868,7 +1044,7 @@ async function probeKnownProtocol(
 
     if (androidRemote || cast) {
         const description = cast
-            ? await fetchText(`http://${ip}:8008/ssdp/device-desc.xml`, 900)
+            ? await fetchText(`http://${ip}:8008/ssdp/device-desc.xml`, 900, signal)
             : null;
         const device = parseCastDeviceDescription(ip, description, androidRemote);
         if (device) return device;
@@ -878,7 +1054,7 @@ async function probeKnownProtocol(
         try {
             const response = await kasaRequest(ip, {
                 system: { get_sysinfo: {} },
-            });
+            }, signal);
             const system = response.system as {
                 get_sysinfo?: Record<string, unknown>;
             } | undefined;
@@ -896,13 +1072,14 @@ async function probeKnownProtocol(
                 model: model || undefined,
                 lastSeen: now,
             };
-        } catch {
+        } catch (error) {
+            if (signal?.aborted) throw error;
             // Portas 9999 de outros programas nao devem virar dispositivos Kasa.
         }
     }
 
     if (http) {
-        const shellyText = await fetchText(`http://${ip}/shelly`, 600);
+        const shellyText = await fetchText(`http://${ip}/shelly`, 600, signal);
 
         if (shellyText) {
             try {
@@ -924,6 +1101,7 @@ async function probeKnownProtocol(
                         manufacturer: "Shelly",
                         model: info.model ?? info.type,
                         lastSeen: now,
+                        capabilities: { actions: [], powerMode: "discrete", requiresPairing: false, generation: info.gen ?? 1 },
                     };
                 }
             } catch {
@@ -931,7 +1109,7 @@ async function probeKnownProtocol(
             }
         }
 
-        const wledText = await fetchText(`http://${ip}/json/info`, 600);
+        const wledText = await fetchText(`http://${ip}/json/info`, 600, signal);
 
         if (wledText) {
             try {
@@ -983,170 +1161,287 @@ function deviceScore(device: DiscoveredDevice): number {
         + (device.kind === "television" ? 5 : 0);
 }
 
-class DeviceRegistry {
+export interface DeviceScanContext {
+    signal: AbortSignal;
+    knownDevices: readonly DiscoveredDevice[];
+    publish: (devices: readonly DiscoveredDevice[]) => void;
+}
+
+export interface DeviceRegistryOptions {
+    filePath?: string;
+    now?: () => number;
+    readStore?: () => Promise<unknown>;
+    writeStore?: (inventory: { version: 2; devices: DiscoveredDevice[] }) => Promise<void>;
+    scan?: (context: DeviceScanContext) => Promise<void>;
+    disabled?: () => boolean;
+    scanTimeoutMs?: number;
+    lookupWaitMs?: number;
+    staleAfterMs?: number;
+}
+
+async function scanNetwork(context: DeviceScanContext): Promise<void> {
+    const { signal, publish } = context;
+    const knownIps = new Set<string>();
+    let arp = new Map<string, string>();
+    const publishLocal = (devices: readonly DiscoveredDevice[]): void => {
+        const now = Date.now();
+        publish(devices.map(device => ({
+            ...device, mac: device.mac ?? arp.get(device.ip), broadcast: broadcastFor(device.ip),
+            online: true, lastReachable: now,
+        })));
+        for (const device of devices) if (isPrivateIpv4(device.ip)) knownIps.add(device.ip);
+    };
+    const arpPromise = readArpTable(signal).then(entries => {
+        arp = entries;
+        const now = Date.now();
+        publish([...entries].slice(0, 64).map(([ip, mac]) => ({
+            id: `network:${mac}`, name: `Dispositivo ${ip}`, ip, mac,
+            kind: "unknown", protocol: "network", lastSeen: now, online: null,
+            broadcast: broadcastFor(ip),
+        })));
+        for (const ip of entries.keys()) knownIps.add(ip);
+    });
+    const mdnsPromise = discoverMdns(1_000, signal).then(publishLocal);
+    const ssdpPromise = discoverSsdp(1_200, signal).then(records => mapDiscoveryLimited(
+        records, 6, async record => {
+            const device = await enrichSsdpRecord(record, signal);
+            publishLocal([device]);
+        }, signal,
+    ));
+    const cloudPromise = discoverTuyaCloudDevices(signal).then(devices => {
+        const ipByMac = new Map([...arp].map(([ip, mac]) => [mac, ip]));
+        publish(devices.map(device => ({ ...device, ip: (device.mac ? ipByMac.get(device.mac) : undefined) ?? device.ip })));
+    });
+    // Local batches are available before slow cloud discovery finishes.
+    const probes = Promise.all([arpPromise, mdnsPromise, ssdpPromise]).then(() => {
+        for (const device of context.knownDevices) if (isPrivateIpv4(device.ip)) knownIps.add(device.ip);
+        return mapDiscoveryLimited([...knownIps].slice(0, 64), 6, async ip => {
+            const device = await probeKnownProtocol(ip, signal);
+            if (device) publishLocal([device]);
+        }, signal);
+    });
+    await Promise.all([probes, cloudPromise]);
+}
+
+function matchesDeviceQuery(device: DiscoveredDevice, query: string): boolean {
+    const normalizedQuery = normalize(query);
+    if (!normalizedQuery) return false;
+    const identity = normalize([device.name, device.manufacturer, device.model, device.kind, device.protocol].filter(Boolean).join(" "));
+    if (/\b(tv|televisao|televisor)\b/.test(normalizedQuery)) return device.kind === "television";
+    if (normalizedQuery === "tomada") return device.kind === "switch";
+    if (/\b(luz|lampada|iluminacao)\b/.test(normalizedQuery)) return device.kind === "light";
+    return identity.includes(normalizedQuery) || (normalize(device.name).length > 0 && normalizedQuery.includes(normalize(device.name)));
+}
+
+export class DeviceRegistry {
     private devices: DiscoveredDevice[] = [];
-    private loaded = false;
+    private loadPromise: Promise<void> | null = null;
     private scanPromise: Promise<DiscoveredDevice[]> | null = null;
+    private scanController: AbortController | null = null;
     private lastScan = 0;
+    private active = true;
+    private writable = true;
+    private generation = 0;
+    private savePromise: Promise<void> = Promise.resolve();
+    private readonly changes = new Set<() => void>();
+
+    constructor(private readonly options: DeviceRegistryOptions = {}) {}
+
+    private now(): number { return (this.options.now ?? Date.now)(); }
+    private disabled(): boolean { return this.options.disabled?.() ?? (process.env.ULTRON_DISABLE_DISCOVERY === "1"); }
+
+    start(): void {
+        if (!this.active) this.lastScan = 0;
+        this.active = true;
+    }
+
+    stop(): void {
+        this.active = false;
+        this.generation += 1;
+        this.scanController?.abort(new DOMException("Descoberta encerrada.", "AbortError"));
+        this.scanController = null;
+        this.scanPromise = null;
+    }
 
     private async load(): Promise<void> {
-        if (this.loaded) {
-            return;
-        }
-
-        this.loaded = true;
-
-        try {
-            const stored = JSON.parse(
-                await readFile(registryPath, "utf8"),
-            ) as DiscoveredDevice[];
-            const cutoff = Date.now() - CACHE_MAX_AGE_MS;
-            this.devices = stored.filter(device => device.lastSeen >= cutoff);
-        } catch {
-            this.devices = [];
-        }
+        if (!this.loadPromise) this.loadPromise = (async () => {
+            try {
+                const stored = this.options.readStore
+                    ? await this.options.readStore()
+                    : JSON.parse(await readFile(this.options.filePath ?? registryPath, "utf8")) as unknown;
+                if (!Array.isArray(stored) && (!stored || typeof stored !== "object"
+                    || !("version" in stored) || stored.version !== 2 || !("devices" in stored) || !Array.isArray(stored.devices))) {
+                    throw new Error("Formato do inventário não suportado.");
+                }
+                this.devices = parseDeviceInventory(stored, this.now());
+            } catch (error) {
+                if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+                    this.writable = false;
+                    debugLog("[DISCOVERY] Inventário indisponível; será reconstruído.");
+                }
+                this.devices = [];
+            }
+        })();
+        return this.loadPromise;
     }
 
     private async save(): Promise<void> {
-        await mkdir(path.dirname(registryPath), { recursive: true });
-        await writeFile(
-            registryPath,
-            `${JSON.stringify(this.devices, null, 2)}\n`,
-            "utf8",
-        );
+        if (!this.writable) return;
+        const inventory = { version: 2 as const, devices: structuredClone(this.devices) };
+        const operation = this.savePromise.catch(() => undefined).then(() => this.options.writeStore
+            ? this.options.writeStore(inventory)
+            : writeDeviceInventoryAtomic(this.options.filePath ?? registryPath, inventory));
+        this.savePromise = operation;
+        await operation;
     }
 
     async list(): Promise<DiscoveredDevice[]> {
         await this.load();
-        return [...this.devices].sort((left, right) => deviceScore(right) - deviceScore(left));
+        return parseDeviceInventory(this.devices, this.now()).sort((left, right) =>
+            Number(Boolean(left.addressConflict)) - Number(Boolean(right.addressConflict))
+            || Number(left.online === false) - Number(right.online === false)
+            || deviceScore(right) - deviceScore(left));
     }
 
-    async scan(force = false): Promise<DiscoveredDevice[]> {
+    async scan(force = false, signal?: AbortSignal): Promise<DiscoveredDevice[]> {
+        signal?.throwIfAborted();
+        const generation = this.generation;
         await this.load();
-
-        if (process.env.ULTRON_DISABLE_DISCOVERY === "1") {
-            return this.list();
-        }
-
-        if (!force && Date.now() - this.lastScan < 30_000) {
-            return this.list();
-        }
-
-        if (this.scanPromise) {
-            return this.scanPromise;
-        }
-
-        this.scanPromise = this.performScan();
-
-        try {
-            return await this.scanPromise;
-        } finally {
-            this.scanPromise = null;
-        }
+        signal?.throwIfAborted();
+        if (!this.active || this.disabled() || generation !== this.generation) return this.list();
+        if (this.scanPromise) return waitWithSignal(this.scanPromise, signal);
+        if (!force && this.lastScan > 0 && this.now() - this.lastScan < 30_000) return this.list();
+        this.lastScan = this.now();
+        const controller = new AbortController();
+        this.scanController = controller;
+        const operation = this.performScan(controller, generation);
+        this.scanPromise = operation;
+        void operation.finally(() => {
+            if (this.scanPromise === operation) this.scanPromise = null;
+            if (this.scanController === controller) this.scanController = null;
+        }).catch(() => undefined);
+        return waitWithSignal(operation, signal);
     }
 
-    private async performScan(): Promise<DiscoveredDevice[]> {
+    private async performScan(controller: AbortController, generation: number): Promise<DiscoveredDevice[]> {
         debugLog("[DISCOVERY] Escaneando dispositivos da rede local.");
-        const [ssdpRecords, mdnsDevices, arpEntries, tuyaDevices] = await Promise.all([
-            discoverSsdp(),
-            discoverMdns(),
-            readArpTable(),
-            discoverTuyaCloudDevices(),
-        ]);
-        const ssdpDevices = await Promise.all(ssdpRecords.map(enrichSsdpRecord));
-        const arpIpByMac = new Map(
-            [...arpEntries].map(([ip, mac]) => [mac, ip]),
-        );
-
-        for (const device of tuyaDevices) {
-            const localIp = device.mac ? arpIpByMac.get(device.mac) : undefined;
-
-            if (localIp) {
-                device.ip = localIp;
-            }
+        const signal = requestSignal(controller.signal, this.options.scanTimeoutMs ?? 12_000);
+        let changed = false;
+        let accepting = true;
+        const context: DeviceScanContext = {
+            signal,
+            knownDevices: structuredClone(this.devices),
+            publish: devices => {
+                if (!accepting || signal.aborted || generation !== this.generation || !this.active) return;
+                const valid = parseDeviceInventory(devices, this.now());
+                if (valid.length === 0) return;
+                this.devices = mergeDeviceInventory(this.devices, valid, this.now());
+                changed = true;
+                for (const notify of this.changes) notify();
+            },
+        };
+        try {
+            await waitWithSignal((this.options.scan ?? scanNetwork)(context), signal);
+        } catch (error) {
+            if (controller.signal.aborted) throw error;
+            debugLog("[DISCOVERY] Atualização parcial; mantendo o inventário disponível.");
+        } finally {
+            accepting = false;
+            if (!controller.signal.aborted) controller.abort(new DOMException("Atualização de descoberta concluída.", "AbortError"));
+            if (changed) await this.save().catch(() => debugLog("[DISCOVERY] Não foi possível persistir o inventário."));
         }
-
-        const knownIps = new Set([
-            ...arpEntries.keys(),
-            ...ssdpDevices.map(device => device.ip),
-            ...mdnsDevices.map(device => device.ip),
-        ]);
-        const probed = await Promise.all(
-            [...knownIps].slice(0, 64).map(probeKnownProtocol),
-        );
-        const found = [...ssdpDevices, ...mdnsDevices, ...tuyaDevices, ...probed.filter(
-            (device): device is DiscoveredDevice => device !== null,
-        )];
-        const existingByIp = new Map(this.devices.map(device => [device.ip, device]));
-        const mergedByIp = new Map<string, DiscoveredDevice>();
-
-        for (const discovered of found) {
-            const existing = existingByIp.get(discovered.ip);
-            const mac = arpEntries.get(discovered.ip) ?? discovered.mac ?? existing?.mac;
-            const preferred = existing && deviceScore(existing) > deviceScore(discovered)
-                ? existing
-                : discovered;
-
-            mergedByIp.set(discovered.ip, {
-                ...existing,
-                ...preferred,
-                mac,
-                broadcast: isPrivateIpv4(discovered.ip)
-                    ? broadcastFor(discovered.ip) ?? existing?.broadcast
-                    : existing?.broadcast,
-                authToken: existing?.authToken,
-                lastSeen: Date.now(),
-            });
-        }
-
-        for (const [ip, mac] of arpEntries) {
-            if (mergedByIp.has(ip)) {
-                continue;
-            }
-
-            const existing = existingByIp.get(ip);
-            mergedByIp.set(ip, existing
-                ? {
-                    ...existing,
-                    mac,
-                    broadcast: broadcastFor(ip) ?? existing.broadcast,
-                    lastSeen: Date.now(),
-                }
-                : {
-                    id: `network:${mac}`,
-                    name: `Dispositivo ${ip}`,
-                    ip,
-                    mac,
-                    broadcast: broadcastFor(ip),
-                    kind: "unknown",
-                    protocol: "network",
-                    lastSeen: Date.now(),
-                });
-        }
-
-        const cutoff = Date.now() - CACHE_MAX_AGE_MS;
-
-        for (const existing of this.devices) {
-            if (!mergedByIp.has(existing.ip) && existing.lastSeen >= cutoff) {
-                mergedByIp.set(existing.ip, existing);
-            }
-        }
-
-        this.devices = [...mergedByIp.values()];
-        this.lastScan = Date.now();
-        await this.save();
-        debugLog(`[DISCOVERY] ${found.length} dispositivo(s) identificado(s).`);
         return this.list();
     }
 
-    async saveToken(ip: string, token: string): Promise<void> {
-        await this.load();
-        const device = this.devices.find(item => item.ip === ip);
+    private async waitForDevices(
+        matches: (device: DiscoveredDevice) => boolean,
+        operation: Promise<DiscoveredDevice[]>, budgetMs: number, signal?: AbortSignal,
+    ): Promise<DiscoveredDevice[]> {
+        return new Promise((resolve, reject) => {
+            let settled = false;
+            const current = (): DiscoveredDevice[] => this.devices.filter(matches);
+            const finish = (error?: unknown): void => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                this.changes.delete(updated);
+                signal?.removeEventListener("abort", aborted);
+                error === undefined ? resolve(current()) : reject(error);
+            };
+            const updated = (): void => { if (current().length) finish(); };
+            const aborted = (): void => finish(signal?.reason);
+            const timer = setTimeout(() => finish(), budgetMs);
+            this.changes.add(updated);
+            operation.then(() => finish(), error => finish(error));
+            if (signal?.aborted) aborted();
+            else signal?.addEventListener("abort", aborted, { once: true });
+            updated();
+        });
+    }
 
-        if (device) {
-            device.authToken = token;
-            await this.save();
+    async find(query: string, signal?: AbortSignal): Promise<DiscoveredDevice[]> {
+        signal?.throwIfAborted();
+        if (!this.active || this.disabled() || !normalize(query)) return [];
+        const devices = await this.list();
+        signal?.throwIfAborted();
+        const matches = (device: DiscoveredDevice): boolean => matchesDeviceQuery(device, query);
+        const matching = devices.filter(matches);
+        const stale = !this.lastScan || this.now() - this.lastScan >= (this.options.staleAfterMs ?? SCAN_INTERVAL_MS);
+        if (matching.length) {
+            if (stale) void this.scan().catch(() => undefined);
+            return matching;
         }
+        await this.waitForDevices(matches, this.scan(), this.options.lookupWaitMs ?? 1_500, signal);
+        signal?.throwIfAborted();
+        return (await this.list()).filter(matches);
+    }
+
+    async current(device: DiscoveredDevice): Promise<DiscoveredDevice> {
+        await this.load();
+        const exact = this.devices.find(item => sameDeviceIdentity(item, device));
+        if (exact) return { ...exact };
+        const occupant = this.devices.find(item => item.ip === device.ip);
+        if (occupant && (occupant.id !== device.id || normalizeMac(occupant.mac) !== normalizeMac(device.mac))) {
+            return { ...device, addressConflict: true, online: false };
+        }
+        return occupant ?? device;
+    }
+
+    async refreshIdentity(device: DiscoveredDevice, signal?: AbortSignal): Promise<DiscoveredDevice | null> {
+        if (!normalizeMac(device.mac) && !device.deviceId && !stableId(device)) return null;
+        const matches = (candidate: DiscoveredDevice): boolean => sameDeviceIdentity(candidate, device)
+            && candidate.ip !== device.ip && !candidate.addressConflict;
+        await this.waitForDevices(matches, this.scan(true), Math.min(this.options.lookupWaitMs ?? 1_500, 1_500), signal);
+        return (await this.list()).find(matches) ?? null;
+    }
+
+    async recordOutcome(device: DiscoveredDevice, result?: unknown, failed = false): Promise<void> {
+        await this.load();
+        const target = this.devices.find(item => sameDeviceIdentity(item, device) && item.ip === device.ip);
+        if (!target) return;
+        target.online = !failed;
+        if (!failed) {
+            target.lastReachable = this.now();
+            const outcome = result && typeof result === "object" ? result as Record<string, unknown> : undefined;
+            // A reachable status endpoint does not prove remote control authorization.
+            if (outcome?.confirmed === true || outcome?.status === "accepted" || outcome?.optimistic === true) {
+                target.controllable = true;
+            }
+            if (device.protocol === "android-tv") target.paired = true;
+            if (outcome?.confirmed === true) {
+                target.lastConfirmed = this.now();
+            }
+        }
+        await this.save().catch(() => debugLog("[DISCOVERY] Atualização de estado não persistida."));
+    }
+
+    async saveToken(device: DiscoveredDevice, token: string): Promise<void> {
+        await this.load();
+        const target = this.devices.find(item => item.protocol === device.protocol && sameDeviceIdentity(item, device));
+        if (!target) return;
+        target.authToken = token;
+        target.paired = true;
+        await this.save();
     }
 }
 
@@ -1158,6 +1453,7 @@ export function startAutomaticDeviceDiscovery(): void {
         return;
     }
 
+    registry.start();
     void registry.scan().catch(error => {
         debugLog("[DISCOVERY] Falha no scan inicial:", error);
     });
@@ -1170,19 +1466,29 @@ export function startAutomaticDeviceDiscovery(): void {
 }
 
 export function stopAutomaticDeviceDiscovery(): void {
+    registry.stop();
     if (discoveryTimer) {
         clearInterval(discoveryTimer);
         discoveryTimer = null;
     }
 }
 
-export async function discoverDevices(force = false): Promise<DiscoveredDevice[]> {
-    return registry.scan(force);
+export async function discoverDevices(force = false, signal?: AbortSignal): Promise<DiscoveredDevice[]> {
+    signal?.throwIfAborted();
+    if (!force) {
+        const cached = await registry.list();
+        if (cached.length) {
+            void registry.scan().catch(() => undefined);
+            return cached;
+        }
+    }
+    return registry.scan(force, signal);
 }
 
 export async function isDiscoveredDeviceOnline(
     device: DiscoveredDevice,
     timeoutMs = 350,
+    signal?: AbortSignal,
 ): Promise<boolean> {
     const ports: Partial<Record<DiscoveredProtocol, number[]>> = {
         roku: [8060],
@@ -1196,64 +1502,52 @@ export async function isDiscoveredDeviceOnline(
     };
     const candidates = ports[device.protocol] ?? [];
     return (await Promise.all(
-        candidates.map(port => isPortOpen(device.ip, port, timeoutMs)),
+        candidates.map(port => isPortOpen(device.ip, port, timeoutMs, signal)),
     )).some(Boolean);
 }
 
-async function findDevices(query: string): Promise<DiscoveredDevice[]> {
-    if (process.env.ULTRON_DISABLE_DISCOVERY === "1") {
-        return [];
-    }
-
-    let devices = await registry.list();
-    const normalizedQuery = normalize(query);
-    const matchesDevice = (device: DiscoveredDevice): boolean => {
-        const identity = normalize([
-            device.name,
-            device.manufacturer,
-            device.model,
-            device.kind,
-            device.protocol,
-        ].filter(Boolean).join(" "));
-
-        if (/\b(tv|televisao|televisor)\b/.test(normalizedQuery)) {
-            return device.kind === "television";
-        }
-
-        if (normalizedQuery === "tomada") {
-            return device.kind === "switch";
-        }
-
-        if (/\b(luz|lampada|iluminacao)\b/.test(normalizedQuery)) {
-            return device.kind === "light";
-        }
-
-        return identity.includes(normalizedQuery)
-            || normalizedQuery.includes(normalize(device.name));
-    };
-    let matching = devices.filter(matchesDevice);
-
-    if (matching.length === 0) {
-        devices = await registry.scan(true);
-        matching = devices.filter(matchesDevice);
-    }
-
-    return matching.sort((left, right) => deviceScore(right) - deviceScore(left));
+async function findDevices(query: string, signal?: AbortSignal): Promise<DiscoveredDevice[]> {
+    return registry.find(query, signal);
 }
 
-export async function findDiscoveredTelevision(): Promise<DiscoveredDevice | null> {
-    return (await findDevices("televisao"))[0] ?? null;
+export async function findDiscoveredTelevision(signal?: AbortSignal): Promise<DiscoveredDevice | null> {
+    return (await findDevices("televisao", signal))[0] ?? null;
 }
 
 export async function findDiscoveredDevice(
     name: string,
+    signal?: AbortSignal,
 ): Promise<DiscoveredDevice | null> {
-    return (await findDevices(name))[0] ?? null;
+    return (await findDevices(name, signal))[0] ?? null;
 }
 
-async function rokuCommand(device: DiscoveredDevice, action: string): Promise<unknown> {
+export interface DeviceControlAdapters {
+    fetch?: typeof fetch;
+    createWebSocket?: (url: string) => WebSocket;
+    kasaRequest?: (ip: string, command: Record<string, unknown>, signal?: AbortSignal) => Promise<Record<string, unknown>>;
+    androidControl?: (device: DiscoveredDevice, action: AndroidTvAction, signal?: AbortSignal) => Promise<unknown>;
+    tuyaRequest?: (args: string[], signal?: AbortSignal) => Promise<TuyaServiceResult>;
+    saveToken?: (device: DiscoveredDevice, token: string) => Promise<void>;
+}
+
+async function deviceHttp(
+    url: string, init: RequestInit, timeoutMs: number, signal: AbortSignal | undefined,
+    adapters: DeviceControlAdapters,
+): Promise<Response> {
+    signal?.throwIfAborted();
+    const response = await (adapters.fetch ?? fetch)(url, {
+        ...init, redirect: "error", signal: requestSignal(signal, timeoutMs),
+    });
+    if (!response.ok) throw new Error(`Dispositivo respondeu HTTP ${response.status}.`);
+    return response;
+}
+
+async function rokuCommand(
+    device: DiscoveredDevice, action: string, signal?: AbortSignal, adapters: DeviceControlAdapters = {},
+): Promise<unknown> {
     if (action === "status") {
-        return fetchText(`http://${device.ip}:8060/query/device-info`, 1_500);
+        const response = await deviceHttp(`http://${device.ip}:8060/query/device-info`, {}, 1_500, signal, adapters);
+        return { online: true, deviceInfo: await response.text(), confirmed: false, status: "unknown" };
     }
 
     const keys: Record<string, string> = {
@@ -1285,19 +1579,14 @@ async function rokuCommand(device: DiscoveredDevice, action: string): Promise<un
         throw new Error(`Ação ${action} não suportada pela TV Roku.`);
     }
 
-    const response = await fetch(`http://${device.ip}:8060/keypress/${key}`, {
-        method: "POST",
-        signal: AbortSignal.timeout(2_000),
-    });
-
-    if (!response.ok) {
-        throw new Error(`Roku respondeu ${response.status}.`);
-    }
-
-    return { key };
+    await deviceHttp(`http://${device.ip}:8060/keypress/${key}`, { method: "POST" }, 2_000, signal, adapters);
+    return { key, confirmed: false, status: "accepted" };
 }
 
-async function samsungCommand(device: DiscoveredDevice, action: string): Promise<unknown> {
+async function samsungCommand(
+    device: DiscoveredDevice, action: string, signal?: AbortSignal, adapters: DeviceControlAdapters = {},
+): Promise<unknown> {
+    signal?.throwIfAborted();
     const keys: Record<string, string> = {
         on: "KEY_POWERON",
         off: "KEY_POWEROFF",
@@ -1326,8 +1615,8 @@ async function samsungCommand(device: DiscoveredDevice, action: string): Promise
     const key = keys[action];
 
     if (action === "status") {
-        const response = await fetchText(`http://${device.ip}:8001/api/v2/`, 1_500);
-        return { online: response !== null };
+        await deviceHttp(`http://${device.ip}:8001/api/v2/`, {}, 1_500, signal, adapters);
+        return { online: true, confirmed: false, status: "unknown" };
     }
 
     if (!key) {
@@ -1337,10 +1626,13 @@ async function samsungCommand(device: DiscoveredDevice, action: string): Promise
     return new Promise((resolve, reject) => {
         const name = Buffer.from("Ultron", "utf8").toString("base64");
         const token = device.authToken ? `&token=${encodeURIComponent(device.authToken)}` : "";
-        const socket = new WebSocket(
+        const socket = (adapters.createWebSocket ?? (url => new WebSocket(url)))(
             `ws://${device.ip}:8001/api/v2/channels/samsung.remote.control?name=${encodeURIComponent(name)}${token}`,
         );
         let settled = false;
+        let sent = false;
+        let responseTimer: NodeJS.Timeout | undefined;
+        const abort = (): void => finish(signal?.reason instanceof Error ? signal.reason : new DOMException("Operação cancelada.", "AbortError"));
         const timeout = setTimeout(() => {
             finish(new Error("A TV não autorizou o Ultron. Aceite o pareamento exibido nela."));
         }, 10_000);
@@ -1352,12 +1644,20 @@ async function samsungCommand(device: DiscoveredDevice, action: string): Promise
 
             settled = true;
             clearTimeout(timeout);
-            socket.close();
+            clearTimeout(responseTimer);
+            signal?.removeEventListener("abort", abort);
+            try { socket.close(); } catch { /* Closing an interrupted handshake is best effort. */ }
             error ? reject(error) : resolve(value);
         };
 
         socket.onerror = () => finish(new Error("Não foi possível conectar ao controle Samsung."));
+        socket.onclose = () => {
+            if (!settled) finish(sent ? undefined : new Error("Conexão Samsung encerrada antes do comando."),
+                sent ? { key, confirmed: false, status: "accepted" } : undefined);
+        };
+        signal?.addEventListener("abort", abort, { once: true });
         socket.onmessage = event => {
+            if (settled || signal?.aborted) return;
             try {
                 const message = JSON.parse(String(event.data)) as {
                     event?: string;
@@ -1369,14 +1669,16 @@ async function samsungCommand(device: DiscoveredDevice, action: string): Promise
                     return;
                 }
 
-                if (message.event !== "ms.channel.connect") {
+                if (message.event !== "ms.channel.connect" || sent) {
                     return;
                 }
 
                 if (message.data?.token) {
-                    void registry.saveToken(device.ip, message.data.token);
+                    void (adapters.saveToken ?? ((target, value) => registry.saveToken(target, value)))(device, message.data.token)
+                        .catch(() => debugLog("[DISCOVERY] Token Samsung não persistido."));
                 }
 
+                sent = true;
                 socket.send(JSON.stringify({
                     method: "ms.remote.control",
                     params: {
@@ -1386,7 +1688,7 @@ async function samsungCommand(device: DiscoveredDevice, action: string): Promise
                         TypeOfRemote: "SendRemoteKey",
                     },
                 }));
-                setTimeout(() => finish(undefined, { key }), 250);
+                responseTimer = setTimeout(() => finish(undefined, { key, confirmed: false, status: "accepted" }), 250);
             } catch (error) {
                 finish(error instanceof Error ? error : new Error(String(error)));
             }
@@ -1394,100 +1696,179 @@ async function samsungCommand(device: DiscoveredDevice, action: string): Promise
     });
 }
 
-export async function controlDiscoveredDevice(
-    device: DiscoveredDevice,
-    action: string,
-    signal?: AbortSignal,
+function kasaPayload(response: Record<string, unknown>, operation: string): Record<string, unknown> {
+    const system = response.system;
+    const payload = system && typeof system === "object" ? (system as Record<string, unknown>)[operation] : undefined;
+    if (!payload || typeof payload !== "object") throw new Error("O dispositivo Kasa retornou uma resposta incompleta.");
+    const result = payload as Record<string, unknown>;
+    if (result.err_code !== undefined && result.err_code !== 0) {
+        throw new Error("O dispositivo Kasa recusou o comando.");
+    }
+    if (operation === "set_relay_state" && result.err_code !== 0) {
+        throw new Error("O dispositivo Kasa não confirmou o recebimento do comando.");
+    }
+    return result;
+}
+
+const shellyGenerations = new Map<string, { generation: number; expires: number }>();
+
+export async function executeDiscoveredDeviceCommand(
+    device: DiscoveredDevice, action: string, signal?: AbortSignal, adapters: DeviceControlAdapters = {},
 ): Promise<unknown> {
-    if (device.protocol === "roku") {
-        return rokuCommand(device, action);
+    signal?.throwIfAborted();
+    if (device.protocol !== "tuya-cloud" && !isPrivateIpv4(device.ip)) {
+        throw new Error("O dispositivo não possui um endereço válido na rede local.");
     }
-
-    if (device.protocol === "samsung") {
-        return samsungCommand(device, action);
+    if (!deviceCapabilities(device).actions.includes(action)) {
+        throw new Error(device.name + " foi encontrado, mas não possui uma integração disponível para esse comando.");
     }
-
+    if (device.protocol === "roku") return rokuCommand(device, action, signal, adapters);
+    if (device.protocol === "samsung") return samsungCommand(device, action, signal, adapters);
     if (device.protocol === "android-tv") {
-        return androidTvRemote.control(device, action as AndroidTvAction, signal);
+        return (adapters.androidControl ?? ((target, command, abort) => androidTvRemote.control(target, command, abort)))(
+            device, action as AndroidTvAction, signal,
+        );
     }
 
     if (device.protocol === "kasa") {
+        const request = adapters.kasaRequest ?? kasaRequest;
         if (action === "status") {
-            return kasaRequest(device.ip, { system: { get_sysinfo: {} } });
+            const response = await request(device.ip, { system: { get_sysinfo: {} } }, signal);
+            const info = kasaPayload(response, "get_sysinfo");
+            const confirmed = info.relay_state === 0 || info.relay_state === 1;
+            return { ...response, confirmed, status: confirmed ? "confirmed" : "unknown",
+                powered: confirmed ? info.relay_state === 1 : undefined };
         }
-
-        if (action !== "on" && action !== "off" && action !== "toggle") {
-            throw new Error(`Ação ${action} não suportada pelo dispositivo Kasa.`);
-        }
-
         let desiredState = action === "on" ? 1 : 0;
-
         if (action === "toggle") {
-            const status = await kasaRequest(device.ip, { system: { get_sysinfo: {} } });
-            const system = status.system as { get_sysinfo?: { relay_state?: number } } | undefined;
-            desiredState = system?.get_sysinfo?.relay_state ? 0 : 1;
+            const info = kasaPayload(await request(device.ip, { system: { get_sysinfo: {} } }, signal), "get_sysinfo");
+            if (info.relay_state !== 0 && info.relay_state !== 1) {
+                throw new Error("O dispositivo Kasa não informou o estado; não enviei toggle.");
+            }
+            desiredState = info.relay_state === 1 ? 0 : 1;
         }
-
-        return kasaRequest(device.ip, {
-            system: { set_relay_state: { state: desiredState } },
-        });
+        signal?.throwIfAborted();
+        const response = await request(device.ip, { system: { set_relay_state: { state: desiredState } } }, signal);
+        kasaPayload(response, "set_relay_state");
+        return { ...response, confirmed: false, status: "accepted" };
     }
 
     if (device.protocol === "shelly") {
-        const generation = await fetchText(`http://${device.ip}/shelly`, 800);
-        const isGen2 = generation ? Number((JSON.parse(generation) as { gen?: number }).gen ?? 1) >= 2 : false;
-        const url = isGen2
-            ? action === "status"
-                ? `http://${device.ip}/rpc/Switch.GetStatus?id=0`
-                : `http://${device.ip}/rpc/Switch.Set?id=0&on=${action === "on"}`
-            : action === "status"
-                ? `http://${device.ip}/relay/0`
-                : `http://${device.ip}/relay/0?turn=${action}`;
-        const response = await fetchText(url, 1_500);
-
-        if (response === null) {
-            throw new Error("O dispositivo Shelly não respondeu.");
+        const key = inventoryKey(device);
+        const cached = shellyGenerations.get(key);
+        let generation = device.capabilities?.generation
+            ?? (cached && cached.expires > Date.now() ? cached.generation : undefined);
+        if (generation === undefined) {
+            const response = await deviceHttp("http://" + device.ip + "/shelly", {}, 800, signal, adapters);
+            const info = await response.json() as { gen?: number; type?: string; model?: string };
+            if (!info || (!info.gen && !info.type && !info.model)) throw new Error("O dispositivo não confirmou a identificação Shelly.");
+            generation = info.gen ?? 1;
+            shellyGenerations.set(key, { generation, expires: Date.now() + 60 * 60_000 });
+            if (shellyGenerations.size > MAX_INVENTORY_DEVICES) shellyGenerations.delete(shellyGenerations.keys().next().value!);
         }
-
-        return JSON.parse(response) as unknown;
+        const endpoint = generation >= 2
+            ? action === "status" ? "/rpc/Switch.GetStatus?id=0"
+                : action === "toggle" ? "/rpc/Switch.Toggle?id=0"
+                    : "/rpc/Switch.Set?id=0&on=" + (action === "on")
+            : action === "status" ? "/relay/0" : "/relay/0?turn=" + action;
+        const response = await deviceHttp("http://" + device.ip + endpoint, {}, 1_500, signal, adapters);
+        const payload = await response.json() as Record<string, unknown>;
+        if (!payload || typeof payload !== "object" || payload.error || (typeof payload.code === "number" && payload.code !== 0)) {
+            throw new Error("O dispositivo Shelly recusou o comando.");
+        }
+        if (action === "status") {
+            const powered = generation >= 2 ? payload.output : payload.ison;
+            const confirmed = typeof powered === "boolean";
+            return { ...payload, powered: confirmed ? powered : undefined, confirmed, status: confirmed ? "confirmed" : "unknown" };
+        }
+        // Gen2 was_on describes the PREVIOUS state, not confirmation of the new one.
+        const acknowledgement = generation >= 2 ? payload.was_on : payload.ison;
+        if (typeof acknowledgement !== "boolean") throw new Error("O dispositivo Shelly não confirmou o recebimento do comando.");
+        return { ...payload, confirmed: false, status: "accepted" };
     }
 
     if (device.protocol === "wled") {
         if (action === "status") {
-            return fetchText(`http://${device.ip}/json/state`, 1_500);
+            const response = await deviceHttp("http://" + device.ip + "/json/state", {}, 1_500, signal, adapters);
+            const state = await response.json() as Record<string, unknown>;
+            if (!state || typeof state !== "object") throw new Error("Estado WLED inválido.");
+            const confirmed = typeof state.on === "boolean";
+            return { ...state, powered: confirmed ? state.on : undefined, confirmed, status: confirmed ? "confirmed" : "unknown" };
         }
-
-        if (action !== "on" && action !== "off" && action !== "toggle") {
-            throw new Error(`Ação ${action} não suportada pelo WLED.`);
-        }
-
-        const response = await fetch(`http://${device.ip}/json/state`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
+        const response = await deviceHttp("http://" + device.ip + "/json/state", {
+            method: "POST", headers: { "Content-Type": "application/json" },
             body: JSON.stringify(action === "toggle" ? { on: "t" } : { on: action === "on" }),
-            signal: AbortSignal.timeout(1_500),
-        });
-
-        if (!response.ok) {
-            throw new Error(`WLED respondeu ${response.status}.`);
-        }
-
-        return response.json() as Promise<unknown>;
+        }, 1_500, signal, adapters);
+        const result = await response.json() as Record<string, unknown>;
+        if (!result || typeof result !== "object" || result.error || result.success === false) throw new Error("O WLED recusou o comando.");
+        return { ...result, confirmed: false, status: "accepted" };
     }
 
     if (device.protocol === "tuya-cloud") {
-        if (!device.deviceId) {
-            throw new Error("O dispositivo Tuya foi descoberto sem identificador válido.");
-        }
-
-        return runTuyaHomeService([
-            "control",
-            device.deviceId,
-            action,
-        ]);
+        if (!device.deviceId) throw new Error("O dispositivo Tuya foi descoberto sem identificador válido.");
+        const result = await (adapters.tuyaRequest ?? runTuyaHomeService)(["control", device.deviceId, action], signal);
+        if (result.success !== true) throw new Error("O dispositivo Tuya recusou o comando.");
+        return result;
     }
+    throw new Error(device.name + " foi encontrado, mas não possui integração de controle disponível.");
+}
 
-    throw new Error(
-        `${device.name} foi encontrado automaticamente, mas exige pareamento ou uma integração do fabricante para aceitar esse comando.`,
-    );
+export function isSafeDiscoveryRetry(device: DiscoveredDevice, action: string): boolean {
+    if (action === "status") return true;
+    return (action === "on" || action === "off")
+        && ["roku", "kasa", "shelly", "wled", "tuya-cloud"].includes(device.protocol);
+}
+
+function isTransportFailure(error: unknown): boolean {
+    if (!error || typeof error !== "object") return false;
+    const failure = error as { code?: string; name?: string; cause?: unknown; message?: string };
+    if (["ECONNREFUSED", "ECONNRESET", "EHOSTUNREACH", "ENETUNREACH", "ETIMEDOUT", "ENOTFOUND"].includes(failure.code ?? "")) return true;
+    if (failure.name === "TimeoutError" || /timeout|não foi possível conectar|conexão .*encerrada|demorou demais para responder|\b(?:ECONNREFUSED|ECONNRESET|EHOSTUNREACH|ETIMEDOUT)\b/i.test(failure.message ?? "")) return true;
+    return failure.cause !== error && isTransportFailure(failure.cause);
+}
+
+export interface DiscoveredDeviceControlOptions {
+    registry?: Pick<DeviceRegistry, "current" | "refreshIdentity" | "recordOutcome">;
+    adapters?: DeviceControlAdapters;
+    execute?: (device: DiscoveredDevice, action: string, signal?: AbortSignal) => Promise<unknown>;
+}
+
+export async function controlDiscoveredDevice(
+    device: DiscoveredDevice, action: string, signal?: AbortSignal, options: DiscoveredDeviceControlOptions = {},
+): Promise<unknown> {
+    signal?.throwIfAborted();
+    const inventory = options.registry ?? registry;
+    const lookupStart = performance.now();
+    let current = await inventory.current(device);
+    perf.record("Device lookup", performance.now() - lookupStart);
+    signal?.throwIfAborted();
+    if (current.addressConflict && current.protocol !== "tuya-cloud") {
+        const recovered = await inventory.refreshIdentity(current, signal);
+        if (!recovered || recovered.addressConflict || !sameDeviceIdentity(current, recovered)) {
+            throw new Error("O IP salvo pertence a outro dispositivo. Não enviei o comando.");
+        }
+        current = recovered;
+    }
+    const execute = options.execute ?? ((target, command, abort) => executeDiscoveredDeviceCommand(target, command, abort, options.adapters));
+    const run = async (target: DiscoveredDevice): Promise<unknown> => {
+        signal?.throwIfAborted();
+        const result = await perf.measure("Device command", () => execute(target, action, signal));
+        void inventory.recordOutcome(target, result).catch(() => undefined);
+        return result;
+    };
+    try {
+        return await run(current);
+    } catch (error) {
+        if (signal?.aborted || !isTransportFailure(error)) throw error;
+        void inventory.recordOutcome(current, undefined, true).catch(() => undefined);
+        if (!isSafeDiscoveryRetry(current, action)) {
+            // Refresh may help the NEXT explicit request, but never replay a toggle.
+            void inventory.refreshIdentity(current, signal).catch(() => undefined);
+            throw error;
+        }
+        const recovered = await inventory.refreshIdentity(current, signal);
+        signal?.throwIfAborted();
+        if (!recovered || recovered.addressConflict || recovered.ip === current.ip || !sameDeviceIdentity(current, recovered)) throw error;
+        return run(recovered);
+    }
 }

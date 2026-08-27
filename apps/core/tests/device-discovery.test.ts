@@ -44,7 +44,7 @@ test("ignora pacotes mDNS inválidos sem interromper o scan", () => {
     assert.deepEqual(parseMdnsResponse(Buffer.alloc(0)), []);
 });
 
-test("classifica uma TCL com Android TV Remote como televisão controlável", () => {
+test("classifica uma TCL com Android TV Remote como televisão com protocolo de controle", () => {
     const device = parseCastDeviceDescription(
         "192.168.0.6",
         `<?xml version="1.0"?>

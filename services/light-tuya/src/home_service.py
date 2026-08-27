@@ -6,10 +6,12 @@ import unicodedata
 from pathlib import Path
 
 import tinytuya
+from light_service import get_cloud as shared_cloud
 
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 CLOUD_FILE = ROOT_DIR / "tinytuya.json"
+_switch_codes: dict[str, str] = {}
 
 
 def send(data: dict) -> None:
@@ -26,18 +28,7 @@ def normalize(value: str) -> str:
 
 
 def get_cloud() -> tinytuya.Cloud:
-    if not CLOUD_FILE.exists():
-        raise FileNotFoundError(
-            f"Credenciais Tuya Cloud não encontradas: {CLOUD_FILE}"
-        )
-
-    config = json.loads(CLOUD_FILE.read_text(encoding="utf-8"))
-    return tinytuya.Cloud(
-        apiRegion=config["apiRegion"],
-        apiKey=config["apiKey"],
-        apiSecret=config["apiSecret"],
-        apiDeviceID=config["apiDeviceID"],
-    )
+    return shared_cloud()[0]
 
 
 def list_devices(cloud: tinytuya.Cloud) -> list[dict]:
@@ -79,6 +70,8 @@ def public_device(device: dict) -> dict:
 
 
 def choose_switch_code(cloud: tinytuya.Cloud, device_id: str) -> str:
+    if device_id in _switch_codes:
+        return _switch_codes[device_id]
     functions = cloud.getfunctions(device_id)
 
     if isinstance(functions, dict) and functions.get("success"):
@@ -93,6 +86,7 @@ def choose_switch_code(cloud: tinytuya.Cloud, device_id: str) -> str:
             value_type = str(entry.get("type", "")).lower()
 
             if code.startswith("switch") and value_type in ("bool", "boolean"):
+                _switch_codes[device_id] = code
                 return code
 
     status = cloud.getstatus(device_id)
@@ -105,34 +99,40 @@ def choose_switch_code(cloud: tinytuya.Cloud, device_id: str) -> str:
             code = str(entry.get("code", ""))
 
             if code.startswith("switch") and isinstance(entry.get("value"), bool):
+                _switch_codes[device_id] = code
                 return code
 
     raise RuntimeError("O dispositivo Tuya não expõe um controle liga/desliga compatível.")
 
 
-def main() -> None:
-    action = sys.argv[1].lower() if len(sys.argv) > 1 else "discover"
+def execute(arguments: list[str]) -> dict:
+    action = arguments[0].lower() if arguments else "discover"
+    if action != "discover" and (action != "control" or len(arguments) != 3):
+        raise ValueError("Uso: home_service.py discover | control DEVICE_ID ACTION")
+    if action == "control" and arguments[2].lower() not in ("status", "on", "off", "toggle"):
+        raise ValueError("Ação Tuya não suportada.")
     cloud = get_cloud()
 
     if action == "discover":
-        send({
+        return {
             "success": True,
             "devices": [public_device(device) for device in list_devices(cloud)],
-        })
-        return
+        }
 
-    if action != "control" or len(sys.argv) < 4:
-        raise ValueError("Uso: home_service.py discover | control DEVICE_ID ACTION")
-
-    device_id = sys.argv[2]
-    requested_action = sys.argv[3].lower()
+    device_id = arguments[1]
+    requested_action = arguments[2].lower()
 
     if requested_action == "status":
         result = cloud.getstatus(device_id)
         if not isinstance(result, dict) or not result.get("success"):
             raise RuntimeError(f"Falha ao consultar o dispositivo Tuya: {result}")
-        send({"success": True, "action": "status", "state": result.get("result")})
-        return
+        entries = result.get("result")
+        observed = isinstance(entries, list) and any(
+            isinstance(entry, dict) and str(entry.get("code", "")).startswith("switch")
+            and isinstance(entry.get("value"), bool) for entry in entries
+        )
+        return {"success": True, "action": "status", "state": entries,
+                "confirmed": observed, "status": "confirmed" if observed else "unknown"}
 
     if requested_action not in ("on", "off", "toggle"):
         raise ValueError(f"Ação Tuya não suportada: {requested_action}")
@@ -145,12 +145,15 @@ def main() -> None:
         entries = status.get("result", []) if isinstance(status, dict) else []
         current = next(
             (
-                bool(entry.get("value"))
+                entry.get("value")
                 for entry in entries
                 if isinstance(entry, dict) and entry.get("code") == switch_code
+                and isinstance(entry.get("value"), bool)
             ),
-            False,
+            None,
         )
+        if not isinstance(status, dict) or not status.get("success") or current is None:
+            raise RuntimeError("Estado desconhecido: nenhum toggle foi enviado.")
         desired_state = not current
 
     result = cloud.sendcommand(device_id, {
@@ -158,14 +161,22 @@ def main() -> None:
     })
 
     if not isinstance(result, dict) or not result.get("success"):
+        _switch_codes.pop(device_id, None)
         raise RuntimeError(f"Falha ao controlar o dispositivo Tuya: {result}")
 
-    send({
+    return {
         "success": True,
         "action": requested_action,
         "switch_code": switch_code,
         "state": desired_state,
-    })
+        "confirmed": False,
+        "optimistic": True,
+        "status": "optimistic",
+    }
+
+
+def main() -> None:
+    send(execute(sys.argv[1:]))
 
 
 if __name__ == "__main__":

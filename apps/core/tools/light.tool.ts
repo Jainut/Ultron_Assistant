@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import path from "node:path";
 import { servicePath } from "../src/config/runtime.ts";
 import type { ToolContext } from "../src/tools/tool.ts";
-import { tuyaCloudClient } from "../src/automation/tuya-cloud-client.ts";
+import { tuyaCloudClient, tuyaHomeClient } from "../src/automation/tuya-cloud-client.ts";
 import { perf } from "../src/utils/performance.ts";
 import { debugLog } from "../src/utils/debug.ts";
 
@@ -94,6 +94,15 @@ export async function controlLight(
         );
     }
 
+    if (process.env.ULTRON_TUYA_LEGACY_PROCESS !== "1") {
+        return perf.measure(
+            "Light API request",
+            () => tuyaCloudClient.request(args.slice(1), context.signal),
+        );
+    }
+
+    // Explicit compatibility fallback only. Never replay a timed-out mutation
+    // through another process, since the device may already have accepted it.
     if (preferCloudTransport) {
         try {
             return await perf.measure(
@@ -215,4 +224,10 @@ export async function controlLight(
 
 export function stopLightService(): void {
     tuyaCloudClient.stop();
+    tuyaHomeClient.stop();
+}
+
+/** Preload Python only; no discovery, credentials or device command is executed. */
+export function startLightService(): void {
+    if (process.env.ULTRON_TUYA_LEGACY_PROCESS !== "1") tuyaCloudClient.start();
 }

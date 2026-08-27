@@ -162,11 +162,14 @@ O estudo para uma memória de longo prazo baseada em notas interligadas está em
 
 ## Automação residencial
 
-O Ultron descobre automaticamente os aparelhos da rede local ao iniciar e
-atualiza o inventário a cada cinco minutos. São detectados SSDP/UPnP, mDNS,
+O Ultron descobre automaticamente os aparelhos da rede local em background e
+atualiza o inventário a cada cinco minutos. Um aparelho já conhecido pode ser
+acionado usando o cache, sem aguardar uma nova varredura. São detectados SSDP/UPnP, mDNS,
 Roku, Samsung, LG webOS, Android TV, TP-Link Kasa, Shelly, WLED e dispositivos
 da conta Tuya já vinculada. O inventário interno fica em
-`data/discovered-devices.json` e não precisa ser editado.
+`data/discovered-devices.json` e não precisa ser editado. Detectado não significa
+controlável: identidade, capacidades, pareamento e confirmação ficam separados;
+um IP reutilizado não herda autorização de outro aparelho.
 
 `config/home.devices.json` continua opcional como fallback para Home Assistant
 ou para equipamentos que não anunciam nenhum protocolo. TVs desligadas só
@@ -184,11 +187,18 @@ canal acima/abaixo, parar e mídia anterior/próxima. O comando de ligar só é
 confirmado quando a TV responde com o estado real; o simples envio de
 Wake-on-LAN nunca é anunciado como "TV ligada".
 
-A lâmpada Tuya mantém uma sessão Cloud persistente depois do primeiro fallback.
+A lâmpada Tuya agora reutiliza o worker Python e o socket local desde a primeira
+chamada, com cache de identificação e fallback Cloud com cliente/token reutilizados.
+Descoberta Cloud usa outro worker para não bloquear a fila da lâmpada.
 Por padrão, comandos de alteração usam atualização otimista após a API aceitar a
 operação, evitando a espera e a consulta de estado adicionais. Defina
 `ULTRON_TUYA_CONFIRM_COMMANDS=1` para restaurar confirmação síncrona em todas as
 alterações; consultas de status sempre leem o estado real.
+
+Android TV preserva o pareamento após falhas transitórias. Com estado de energia
+desconhecido, `ligar`/`desligar` não enviam um toggle às cegas. Os limites de
+confirmação e os testes offline estão em [P3: Tuya e TV](docs/P3_TUYA_AND_TV.md)
+e [P3: inventário e descoberta](docs/P3_HOME_DISCOVERY.md).
 
 ## Serviços esperados
 

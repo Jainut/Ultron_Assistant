@@ -21,3 +21,8 @@ data/android-tv-pairings.json
 data/automation/
 data/notifications.json
 data/personal-automation/
+data/indexes/
+data/android-tv-pairings.json.*.tmp
+data/discovered-devices.json.*.tmp
+data/barge-in-calibration*.json
+coverage/
