@@ -1,0 +1,64 @@
+name: Ultron checks
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ultron-checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
+      ULTRON_OPEN_HUD: "0"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          submodules: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: apps/core/package-lock.json
+      - name: Install locked core dependencies
+        run: npm --prefix apps/core ci --ignore-scripts
+      - name: TypeScript
+        run: npm run check
+      - name: ESLint
+        run: npm run lint
+      - name: UTF-8 source validation
+        run: npm run check:utf8
+      - name: Build and test with coverage
+        run: npm run test:coverage
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: services/speech-input/requirements.txt
+      - name: Install test-only Python dependencies
+        run: python -m pip install -r services/speech-input/requirements.txt tinytuya==1.20.0
+      - name: STT endpoint and echo regression tests (no microphone)
+        run: python -m unittest discover -s services/speech-input/tests -v
+      - name: Persistent playback and startup protocol (no Kokoro model)
+        run: python -m unittest discover -s services/tts-kokoro/src -p "test_*.py" -v
+      - name: Tuya daemon regression tests (no LAN or cloud)
+        run: python -m unittest discover -s services/light-tuya/src -p test_tuya_daemon.py -v
+      - name: Upload coverage only
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ultron-core-coverage
+          path: coverage/core.lcov
+          if-no-files-found: warn
+          retention-days: 14

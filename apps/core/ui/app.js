@@ -24,6 +24,22 @@ const metricElements = [
     ["tool_duration", document.querySelector("#metric-tool")],
     ["speech_end_to_first_audio", document.querySelector("#metric-voice")],
 ];
+const serviceStateLabels = {
+    starting: "Iniciando",
+    ready: "Pronto",
+    degraded: "Limitado",
+    restarting: "Reiniciando",
+    failed: "Indisponível",
+    stopped: "Parado",
+};
+const serviceElements = [
+    ["stt", "Whisper"], ["tts", "Kokoro"], ["ollama", "Ollama"],
+    ["tuya", "Tuya local"], ["tuya-home", "Tuya casa"], ["automation", "Rotinas"],
+    ["gmail", "Gmail"], ["google-tasks", "Tarefas"], ["google-calendar", "Agenda"],
+].map(([name, label]) => ({ name, label, row: document.querySelector("#service-" + name),
+    state: document.querySelector("#health-" + name) }));
+const serviceNames = new Set(serviceElements.map(service => service.name));
+const serviceSummary = document.querySelector("#service-summary");
 const qualityLevels = {
     normal: { count: 420, neighbors: 5, fps: 30, dpr: 1.5, pulses: 14 },
     economical: { count: 230, neighbors: 4, fps: 18, dpr: 1, pulses: 6 },
@@ -32,6 +48,7 @@ const qualityLevels = {
 let currentState = "booting";
 let currentMessage = "Inicializando sistemas";
 let connectionStatus = "connecting";
+let currentServices = new Map();
 let manualEconomy = readPerformancePreference();
 let automaticEconomy = false;
 let width = 0;
@@ -101,12 +118,57 @@ function updateTimings(timings) {
         : "Nenhuma medição disponível nesta interação.");
 }
 
+function updateServices(value) {
+    const next = new Map();
+    if (Array.isArray(value)) {
+        for (const entry of value.slice(0, 64)) {
+            if (!entry || typeof entry !== "object" || Array.isArray(entry)
+                || typeof entry.name !== "string" || !serviceNames.has(entry.name) || next.has(entry.name)
+                || typeof entry.state !== "string" || !Object.hasOwn(serviceStateLabels, entry.state)
+                || !Number.isSafeInteger(entry.attempts) || entry.attempts < 0
+                || !Number.isSafeInteger(entry.restarts) || entry.restarts < 0) continue;
+            // Never retain/display lastFailure, provider payloads or arbitrary names.
+            next.set(entry.name, { state: entry.state, attempts: entry.attempts, restarts: entry.restarts });
+        }
+    }
+    currentServices = next;
+}
+
+function updateServiceDisplay() {
+    const disconnected = connectionStatus === "retrying";
+    for (const service of serviceElements) {
+        const health = disconnected ? undefined : currentServices.get(service.name);
+        const state = health?.state ?? "unknown";
+        const text = disconnected ? "Sem conexão" : serviceStateLabels[state] ?? "Sem dados";
+        if (service.row.dataset.health !== state) service.row.dataset.health = state;
+        setText(service.state, text);
+        const detail = service.label + ": " + text + (health
+            ? `. Tentativas: ${health.attempts}; reinícios: ${health.restarts}.` : ".");
+        if (service.row.getAttribute("title") !== detail) service.row.setAttribute("title", detail);
+    }
+    if (disconnected) {
+        setText(serviceSummary, "Conexão interrompida · saúde não confirmada.");
+    } else if (!currentServices.size) {
+        setText(serviceSummary, "Saúde dos serviços ainda não informada.");
+    } else {
+        const states = [...currentServices.values()].map(service => service.state);
+        const ready = states.filter(state => state === "ready").length;
+        const attention = states.filter(state => state === "failed" || state === "degraded").length;
+        const recovering = states.filter(state => state === "starting" || state === "restarting").length;
+        const summary = [`${ready}/${states.length} prontos`];
+        if (attention) summary.push(`${attention} em atenção`);
+        if (recovering) summary.push(`${recovering} iniciando`);
+        setText(serviceSummary, summary.join(" · ") + ".");
+    }
+}
+
 function updateStateDisplay() {
     document.body.dataset.state = currentState;
     document.body.dataset.connected = String(connectionStatus === "connected");
     const disconnected = connectionStatus === "retrying";
     setText(stateElement, disconnected ? "SEM CONEXÃO" : stateLabels[currentState]);
     setText(messageElement, disconnected ? "Aguardando conexão com o Ultron..." : currentMessage);
+    updateServiceDisplay();
     requestDraw();
 }
 
@@ -119,6 +181,7 @@ function applySnapshot(snapshot) {
     if (typeof snapshot.transcript === "string") updateConversation(transcriptElement, snapshot.transcript);
     if (typeof snapshot.response === "string") updateConversation(responseElement, snapshot.response);
     if (Object.hasOwn(snapshot, "timings")) updateTimings(snapshot.timings);
+    if (Object.hasOwn(snapshot, "services")) updateServices(snapshot.services);
     updateStateDisplay();
 }
 
@@ -126,7 +189,7 @@ function queueSnapshot(snapshot) {
     if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) return;
     // Coalesce streaming snapshots; never accumulate a history of DOM updates.
     pendingSnapshot = { ...pendingSnapshot };
-    for (const field of ["state", "message", "transcript", "response", "timings"]) {
+    for (const field of ["state", "message", "transcript", "response", "timings", "services"]) {
         if (Object.hasOwn(snapshot, field)) pendingSnapshot[field] = snapshot[field];
     }
     if (document.hidden || !pageActive || snapshotFrame) return;
@@ -140,6 +203,12 @@ function queueSnapshot(snapshot) {
 
 function setConnection(status) {
     connectionStatus = status;
+    if (status !== "connected") {
+        currentServices = new Map();
+        // A queued frame from the closed stream must not revive stale "ready"
+        // indicators if the next connection is to an older/different backend.
+        if (pendingSnapshot) delete pendingSnapshot.services;
+    }
     setText(connectionElement, {
         connecting: "CONECTANDO",
         connected: "CONECTADO",
@@ -580,6 +649,7 @@ window.addEventListener("pageshow", () => {
 window.addEventListener("online", connect);
 
 updateRenderControl();
+updateServiceDisplay();
 resize();
 resumeClock();
 connect();

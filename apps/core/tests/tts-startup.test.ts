@@ -214,3 +214,79 @@ test("telemetria de startup do TTS mantém compatibilidade e rejeita valores inv
         stdlibImportsMs: 0,
     });
 });
+
+test("health TTS e hook de failure refletem apenas processo próprio e ignoram shutdown normal", async () => {
+    const { service, children } = mockedService();
+    const failures: Error[] = [];
+    const unsubscribe = service.onFailure(error => failures.push(error));
+    service.onFailure(() => { throw new Error("observer failed"); });
+    try {
+        assert.equal(service.isReady(), false);
+        assert.equal(await service.healthCheck(), false);
+        const startup = service.start();
+        children[0].send(ready);
+        await startup;
+        assert.equal(service.isReady(), true);
+        assert.equal(await service.healthCheck(), true);
+        children[0].stdin.emit("error", new Error("EPIPE"));
+        children[0].close(1);
+        assert.equal(failures.length, 1);
+        assert.equal(service.isReady(), false);
+        const retry = service.start();
+        children[1].send(ready);
+        await retry;
+        unsubscribe();
+        service.stop();
+        children[1].close(0);
+        assert.equal(failures.length, 1);
+        assert.equal(await service.healthCheck(), false);
+    } finally {
+        service.stop();
+    }
+});
+
+test("AbortSignal cancela startup TTS sem esperar close e não cancela instância de outro waiter", async () => {
+    const { service, children } = mockedService();
+    const failures: Error[] = [];
+    service.onFailure(error => failures.push(error));
+    try {
+        const owner = new AbortController();
+        const waiter = new AbortController();
+        const startup = service.start(owner.signal);
+        const waiting = service.start(waiter.signal);
+        const rejectedWaiter = assert.rejects(waiting, { name: "AbortError" });
+        waiter.abort();
+        await rejectedWaiter;
+        assert.equal(children[0].killed, false);
+        const rejected = assert.rejects(startup, { name: "AbortError" });
+        owner.abort();
+        await rejected;
+        assert.equal(children[0].killed, true);
+        assert.equal(failures.length, 0);
+        const retry = service.start();
+        children[0].send(ready);
+        assert.equal(service.isReady(), false);
+        children[1].send(ready);
+        await retry;
+        children[0].close(1);
+        assert.equal(service.isReady(), true);
+        await assert.rejects(service.healthCheck(owner.signal), { name: "AbortError" });
+    } finally {
+        service.stop();
+    }
+});
+
+test("exit TTS rejeita síntese mesmo quando os pipes ainda não emitiram close", async () => {
+    const { service, children } = mockedService();
+    try {
+        const startup = service.start();
+        children[0].send(ready);
+        await startup;
+        const pending = assert.rejects(service.synthesize("Frase fixa."), /encerrou/);
+        children[0].emit("exit", 0);
+        await pending;
+        assert.equal(service.isReady(), false);
+    } finally {
+        service.stop();
+    }
+});

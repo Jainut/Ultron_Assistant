@@ -16,7 +16,7 @@ import {
     registerPersonalMonitorTools,
 } from "../personal-automation/index.ts";
 import { AutomationEngine } from "./automation-engine.ts";
-import type { JsonValue } from "./types.ts";
+import type { Job, JsonValue } from "./types.ts";
 
 const defaultTimezone = process.env.ULTRON_TIMEZONE?.trim()
     || "America/Sao_Paulo";
@@ -37,6 +37,8 @@ export const automationEngine = new AutomationEngine({
     pollIntervalMs: 1_000,
     maxConcurrency: 2,
     onError: error => debugLog("[AUTOMATION]", error),
+    canRetryJob: canRetryAutomationJob,
+    awaitInitialTick: false,
 });
 
 let toolsRegistered = false;
@@ -136,6 +138,42 @@ export async function stopAutomationRuntime(): Promise<void> {
 
 function toJsonValue(value: unknown): JsonValue {
     return JSON.parse(JSON.stringify(value)) as JsonValue;
+}
+
+// Explicitly reviewed operations only: a category/capability named "read" can
+// still open apps, change cwd or publish notifications in existing tools.
+const READ_ONLY_ACTIONS = new Set([
+    "get_current_time", "get_current_directory", "list_directory", "find_directory", "find_file",
+    "mail.list", "mail.search", "mail.read", "mail.thread", "mail.summarize",
+    "task.list", "task.search", "task.get",
+    "calendar.list", "calendar.search", "calendar.checkConflicts", "notification.list",
+]);
+
+/** The whole batch restarts on retry, so every action must be safe to repeat. */
+export function canRetryAutomationJob(job: Job): boolean {
+    return job.actions.length > 0 && job.actions.every(action => {
+        if (READ_ONLY_ACTIONS.has(action.type)) return true;
+        const input = action.input && typeof action.input === "object" && !Array.isArray(action.input)
+            ? action.input : undefined;
+        if (!input) return false;
+        if (["control_light", "control_tv", "control_home_device"].includes(action.type)) {
+            return input.action === "status";
+        }
+        if (action.type === "mail.watch") {
+            // The installed monitor uses watchId + messageId and durable NotificationCenter dedupe.
+            return typeof input.watchId === "string" && input.watchId.trim().length > 0;
+        }
+        if (action.type === "calendar.reminderScan") {
+            return typeof input.reminderId === "string" && input.reminderId.trim().length > 0;
+        }
+        if (action.type === "personal.dailyBriefing") {
+            if (input.publishNotification !== true) return true;
+            // A clock-relative briefing can cross a date boundary and change its dedupe key.
+            return typeof input.at === "string" && /(?:Z|[+-]\d{2}:?\d{2})$/i.test(input.at)
+                && Number.isFinite(Date.parse(input.at));
+        }
+        return false;
+    });
 }
 
 function registerUnavailableMonitorAction(type: string): void {

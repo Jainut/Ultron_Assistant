@@ -222,6 +222,15 @@ e [P3: inventário e descoberta](docs/P3_HOME_DISCOVERY.md).
 
 ## Serviços esperados
 
+O CMD já aceita comandos enquanto STT/TTS carregam. No terminal interativo da
+instância, digite um comando e pressione Enter; em outro CMD, use
+`ultron "que horas são?"`. A mesma conversa, tools e confirmações são utilizadas.
+Uma falha de voz ou de uma solicitação não encerra o canal de texto.
+
+`ultron status` e o HUD mostram serviços iniciando, recuperando ou indisponíveis.
+A supervisão limita reinícios e evita replay de ações de resultado incerto.
+Veja [P5: robustez, validação e limites](docs/P5_RELIABILITY.md).
+
 A interface possui uma [esfera neural azul e modo desempenho](docs/HUD_NEURAL_BLUE.md),
 com métricas reais da última interação e transmissão SSE agrupada.
 

@@ -5,9 +5,9 @@ const hud = new HudServer();
 await hud.start();
 hud.update({
     state: "listening",
-    message: "Interface neural operacional",
+    message: "Prévia da interface neural",
     transcript: "Aguardando comando de voz...",
-    response: "Todos os sistemas estão online.",
+    response: "Prévia visual: nenhum microfone, modelo ou dispositivo foi iniciado.",
 });
 
 console.log(`HUD disponível em ${hud.url()}`);

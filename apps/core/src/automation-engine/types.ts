@@ -133,6 +133,10 @@ export interface JobError extends JsonObject {
     readonly code?: string;
     readonly at: IsoDateTime;
     readonly retryable: boolean;
+    /** A failed response/cancellation cannot prove that external effects did not happen. */
+    readonly outcome?: "unknown";
+    /** The runtime refused to repeat this occurrence to avoid duplicate effects. */
+    readonly retrySuppressed?: boolean;
 }
 
 export interface PersistedJobResult extends JsonObject {

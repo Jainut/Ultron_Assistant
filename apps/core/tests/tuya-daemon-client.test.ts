@@ -124,3 +124,39 @@ test("signal já abortado não inicia Python", async () => {
     await assert.rejects(client.request(["on"], AbortSignal.abort()), { name: "AbortError" });
     assert.equal(children.length, 0);
 });
+
+test("Tuya health exige ready real, sem chamar um dispositivo", async () => {
+    const { client, children } = fixture();
+    try {
+        const ready = client.waitUntilReady();
+        assert.equal(await client.healthCheck(), false);
+        children[0]!.send({ type: "ready", mode: "home" });
+        assert.equal(client.isReady(), false);
+        children[0]!.send({ type: "ready", mode: "light" });
+        await ready;
+        assert.equal(await client.healthCheck(), true);
+        assert.equal(children[0]!.messages.length, 0);
+        assert.equal(children.length, 1);
+    } finally { client.stop(); }
+    assert.equal(client.isReady(), false);
+});
+
+test("falha Tuya é observável uma vez e stop deliberado não dispara restart", async () => {
+    const { client, children } = fixture();
+    const failures: Error[] = [];
+    const unsubscribe = client.onFailure(error => { failures.push(error); });
+    const ready = client.waitUntilReady();
+    const rejected = assert.rejects(ready, /encerrado/);
+    children[0]!.emit("error", new Error("fake secret must not propagate"));
+    await rejected;
+    children[0]!.close(1);
+    assert.equal(failures.length, 1);
+    assert.equal(failures[0]!.message.includes("secret"), false);
+    const next = client.waitUntilReady();
+    children[1]!.send({ type: "ready", mode: "light" });
+    await next;
+    client.stop();
+    children[1]!.close();
+    assert.equal(failures.length, 1);
+    unsubscribe();
+});

@@ -12,12 +12,21 @@
     "build": "npm run clean && tsc",
     "start": "node dist/src/cli.js",
     "check": "tsc --noEmit",
+    "check:utf8": "node scripts/check-utf8.mjs",
+    "lint": "eslint .",
+    "format": "prettier --write src tools shared config tests ui",
+    "format:check": "prettier --check src tools shared config tests ui",
+    "test:coverage": "npm run build && node scripts/coverage.mjs",
     "test": "npm run build && node --test dist/tests/*.test.js"
   },
   "devDependencies": {
+    "@eslint/js": "10.0.1",
     "@types/node": "^24.0.0",
+    "eslint": "10.9.1",
+    "prettier": "3.9.6",
     "tsx": "^4.0.0",
-    "typescript": "^5.0.0"
+    "typescript": "^5.0.0",
+    "typescript-eslint": "8.68.0"
   },
   "dependencies": {
     "@kud/androidtv-remote": "^0.1.2",

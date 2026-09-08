@@ -50,11 +50,25 @@
         </section>
 
         <aside class="memory panel" aria-labelledby="systems-title">
-            <div class="section-heading"><span class="section-index">02</span><h2 id="systems-title">INTEGRAÇÕES</h2></div>
-            <p class="panel-caption">Seu ambiente, conectado.</p>
-            <div class="integration-group"><span>INTELIGÊNCIA & VOZ</span><p>Ollama <i>/</i> Whisper <i>/</i> Kokoro</p></div>
-            <div class="integration-group"><span>AUTOMAÇÃO RESIDENCIAL</span><p>Lâmpada Tuya <i>/</i> TV<br>Home Assistant</p></div>
-            <p class="integration-note">Disponibilidade conforme configuração.</p>
+            <div class="section-heading"><span class="section-index">02</span><h2 id="systems-title">SAÚDE DOS SERVIÇOS</h2></div>
+            <p class="panel-caption">Estado informado pelo Ultron.</p>
+            <div class="service-group"><h3>INTELIGÊNCIA & VOZ</h3><dl class="service-list">
+                <div class="service-row" id="service-stt" data-health="unknown"><dt>Whisper</dt><dd id="health-stt">Sem dados</dd></div>
+                <div class="service-row" id="service-tts" data-health="unknown"><dt>Kokoro</dt><dd id="health-tts">Sem dados</dd></div>
+                <div class="service-row" id="service-ollama" data-health="unknown"><dt>Ollama</dt><dd id="health-ollama">Sem dados</dd></div>
+            </dl></div>
+            <div class="service-group"><h3>CASA & ROTINAS</h3><dl class="service-list">
+                <div class="service-row" id="service-tuya" data-health="unknown"><dt>Tuya local</dt><dd id="health-tuya">Sem dados</dd></div>
+                <div class="service-row" id="service-tuya-home" data-health="unknown"><dt>Tuya casa</dt><dd id="health-tuya-home">Sem dados</dd></div>
+                <div class="service-row" id="service-automation" data-health="unknown"><dt>Rotinas</dt><dd id="health-automation">Sem dados</dd></div>
+            </dl></div>
+            <div class="service-group"><h3>ASSISTÊNCIA PESSOAL</h3><dl class="service-list">
+                <div class="service-row" id="service-gmail" data-health="unknown"><dt>Gmail</dt><dd id="health-gmail">Sem dados</dd></div>
+                <div class="service-row" id="service-google-tasks" data-health="unknown"><dt>Tarefas</dt><dd id="health-google-tasks">Sem dados</dd></div>
+                <div class="service-row" id="service-google-calendar" data-health="unknown"><dt>Agenda</dt><dd id="health-google-calendar">Sem dados</dd></div>
+            </dl></div>
+            <p class="integration-note" id="service-summary" role="status">Saúde dos serviços ainda não informada.</p>
+            <p class="capability-note">Saúde dos serviços, não dos dispositivos.<br>TV / Home Assistant: sem telemetria.</p>
             <div class="render-control">
                 <button id="performance-mode" type="button" aria-pressed="false"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M9 1 3 9h4l-1 6 7-9H9Z"/></svg><span>Modo desempenho</span><i aria-hidden="true"></i></button>
                 <span id="render-detail">Visualização adaptativa</span>

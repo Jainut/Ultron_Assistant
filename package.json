@@ -12,6 +12,11 @@
     "start": "npm --prefix apps/core run start",
     "calibrate:barge-in": "npm --prefix apps/core run calibrate:barge-in --",
     "check": "npm --prefix apps/core run check",
+    "check:utf8": "npm --prefix apps/core run check:utf8",
+    "lint": "npm --prefix apps/core run lint",
+    "format": "npm --prefix apps/core run format",
+    "format:check": "npm --prefix apps/core run format:check",
+    "test:coverage": "npm --prefix apps/core run test:coverage",
     "test": "npm --prefix apps/core run test"
   },
   "keywords": [],

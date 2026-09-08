@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.venv/
+services/speech-whisper/
+data/
+coverage/
+*.lock
+package-lock.json
+apps/core/package-lock.json
+ultron.env.cmd
+config/home.devices.json
+services/light-tuya/devices.json
+services/light-tuya/tinytuya.json

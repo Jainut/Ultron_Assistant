@@ -6,7 +6,13 @@ import {
 import type { Readable } from "node:stream";
 import { readFile, unlink } from "node:fs/promises";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { runtimeConfig, servicePath } from "../config/runtime.ts";
+import {
+    awaitServiceOperation,
+    serviceError as normalizeServiceError,
+    timedServiceOperation,
+} from "../system/service-lifecycle.ts";
 import { debugLog, serviceError } from "../utils/debug.ts";
 import { perf } from "../utils/performance.ts";
 import type { PlaybackReference } from "./playback-reference.ts";
@@ -242,6 +248,18 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 
+export interface SpeechToTextServiceOptions {
+    /** Lifecycle tests inject subprocesses and HTTP; no microphone/model is needed. */
+    spawnService?: typeof spawn;
+    fetch?: typeof fetch;
+    startupTimeoutMs?: number;
+    whisperStartupTimeoutMs?: number;
+    captureStartupTimeoutMs?: number;
+    transcriptionTimeoutMs?: number;
+    healthTimeoutMs?: number;
+    pollIntervalMs?: number;
+}
+
 export class SpeechToTextService {
     private readonly speechStartListeners =
         new Set<() => void>();
@@ -253,9 +271,24 @@ export class SpeechToTextService {
     private captureProcess: ChildProcessWithoutNullStreams | null = null;
 
     private captureReady = false;
+    private ready = false;
+    private generation = 0;
+    private lifecycle: AbortController | null = null;
+    private startupPromise: Promise<void> | null = null;
+    private captureReadyResolver: (() => void) | null = null;
+    private readonly failureListeners = new Set<(error: Error) => void>();
+    private sessionFailed = false;
+    // Playback belongs to the conversation, not the capture-process generation.
+    // Remember controls received while the microphone is starting/recovering.
+    private playbackActive: boolean | null = null;
+    private playbackReference: PlaybackReference | null = null;
 
     private pendingResolve: ((text: string) => void) | null = null;
     private pendingReject: ((error: Error) => void) | null = null;
+    private listenId = 0;
+    private listenController: AbortController | null = null;
+    private removeListenAbort: (() => void) | null = null;
+    private activeTranscription: { generation: number; listenId: number; path: string } | null = null;
     private readonly recentTranscriptions: string[] = [];
     private speechEndDelivered = false;
 
@@ -264,6 +297,33 @@ export class SpeechToTextService {
 
     private readonly whisperUrl =
         `http://127.0.0.1:${this.whisperPort}/inference`;
+
+    constructor(private readonly options: SpeechToTextServiceOptions = {}) {}
+
+    isReady(): boolean {
+        return this.ready && this.captureReady
+            && Boolean(this.whisperProcess && !this.whisperProcess.killed)
+            && Boolean(this.captureProcess && !this.captureProcess.killed);
+    }
+
+    onFailure(listener: (error: Error) => void): () => void {
+        this.failureListeners.add(listener);
+        return () => this.failureListeners.delete(listener);
+    }
+
+    async healthCheck(signal?: AbortSignal): Promise<boolean> {
+        signal?.throwIfAborted();
+        if (!this.isReady()) return false;
+        // whisper-server may serialize GET behind inference. A live request is
+        // bounded separately; do not restart a healthy model during decoding.
+        if (this.activeTranscription) return true;
+        try {
+            return await this.probeWhisper(signal) && this.isReady();
+        } catch {
+            signal?.throwIfAborted();
+            return false;
+        }
+    }
 
 
     onSpeechStart(
@@ -297,7 +357,46 @@ export class SpeechToTextService {
         return () => this.transcriptionEndListeners.delete(listener);
     }
 
-    async start(): Promise<void> {
+    start(signal?: AbortSignal): Promise<void> {
+        if (signal?.aborted) return Promise.reject(signal.reason);
+        if (this.isReady()) return Promise.resolve();
+        if (this.startupPromise) return signal
+            ? awaitServiceOperation(this.startupPromise, signal) : this.startupPromise;
+
+        const generation = ++this.generation;
+        const lifecycle = new AbortController();
+        this.lifecycle = lifecycle;
+        this.sessionFailed = false;
+        const abort = (): void => lifecycle.abort(signal?.reason);
+        signal?.addEventListener("abort", abort, { once: true });
+        const task = timedServiceOperation(innerSignal => this.launch(innerSignal, generation), {
+            signal: lifecycle.signal,
+            timeoutMs: this.options.startupTimeoutMs ?? 90_000,
+            label: "STT startup",
+        }).then(() => {
+            lifecycle.signal.throwIfAborted();
+            if (generation !== this.generation) throw new DOMException("STT reiniciado.", "AbortError");
+            this.ready = true;
+        }).catch(error => {
+            if (generation === this.generation) {
+                if (signal?.aborted) {
+                    this.terminateProcesses();
+                } else this.failSession(normalizeServiceError(error), generation);
+            }
+            throw error;
+        }).finally(() => {
+            signal?.removeEventListener("abort", abort);
+            if (this.startupPromise === task) this.startupPromise = null;
+        });
+        this.startupPromise = task;
+        // Listening/startup may be awaited only after a current TTS chunk ends.
+        // Observe rejections now without changing what the original promise returns.
+        void task.catch(() => undefined);
+        return task;
+    }
+
+    private async launch(signal: AbortSignal, generation: number): Promise<void> {
+        signal.throwIfAborted();
         const whisperDir = servicePath("speech-whisper");
 
         const whisperExe = path.join(
@@ -328,7 +427,7 @@ export class SpeechToTextService {
         );
 
 
-        const whisperProcess = spawn(
+        const whisperProcess = (this.options.spawnService ?? spawn)(
             whisperExe,
             [
                 "-m",
@@ -378,22 +477,29 @@ export class SpeechToTextService {
         this.whisperProcess = whisperProcess;
 
 
-        whisperProcess.on(
-            "exit",
-            (code) => {
-                if (code !== 0) {
-                    console.error(
-                        `[Whisper] servidor encerrado com código ${code}`
-                    );
-                }
-            },
-        );
+        const whisperFailure = (error: Error): void => {
+            if (this.whisperProcess === whisperProcess) this.failSession(error, generation);
+        };
+        whisperProcess.once("error", whisperFailure);
+        whisperProcess.once("exit", code => whisperFailure(new Error(
+            `Whisper encerrou com código ${code}.`,
+        )));
+        whisperProcess.once("close", code => whisperFailure(new Error(
+            `Whisper encerrou com código ${code}.`,
+        )));
+        // Both pipes must be drained: a full stderr pipe otherwise stalls decoding.
+        whisperProcess.stdout.resume();
+        whisperProcess.stdout.on("error", whisperFailure);
+        whisperProcess.stderr.on("error", whisperFailure);
+        whisperProcess.stderr.on("data", (data: Buffer) => {
+            if (this.whisperProcess === whisperProcess) serviceError("[Whisper]", data.toString());
+        });
 
+        await this.waitForWhisper(signal);
+        signal.throwIfAborted();
+        if (generation !== this.generation) throw new DOMException("STT reiniciado.", "AbortError");
 
-        await this.waitForWhisper();
-
-
-        this.captureProcess = spawn(
+        const captureProcess = (this.options.spawnService ?? spawn)(
             pythonExe,
             [
                 "-u",
@@ -428,9 +534,25 @@ export class SpeechToTextService {
         );
 
 
-        this.captureProcess.stderr.on(
+        this.captureProcess = captureProcess;
+        const captureFailure = (error: Error): void => {
+            if (this.captureProcess === captureProcess) this.failSession(error, generation);
+        };
+        captureProcess.once("error", captureFailure);
+        captureProcess.once("exit", code => captureFailure(new Error(
+            `Captura de áudio encerrou com código ${code}.`,
+        )));
+        captureProcess.once("close", code => captureFailure(new Error(
+            `Captura de áudio encerrou com código ${code}.`,
+        )));
+        captureProcess.stdin.on("error", captureFailure);
+        captureProcess.stdout.on("error", captureFailure);
+        captureProcess.stderr.on("error", captureFailure);
+
+        captureProcess.stderr.on(
             "data",
             (data) => {
+                if (this.captureProcess !== captureProcess) return;
                 const text = data
                     .toString()
                     .trim();
@@ -444,10 +566,15 @@ export class SpeechToTextService {
 
         let buffer = "";
 
-        this.captureProcess.stdout.on(
+        captureProcess.stdout.on(
             "data",
             (data) => {
+                if (this.captureProcess !== captureProcess || generation !== this.generation) return;
                 buffer += data.toString();
+                if (buffer.length > 1_048_576) {
+                    captureFailure(new Error("A captura excedeu o limite do protocolo JSON."));
+                    return;
+                }
 
                 const lines = buffer.split(
                     "\n"
@@ -470,8 +597,8 @@ export class SpeechToTextService {
                         if (!message) continue;
 
                         void this.handleCaptureMessage(
-                            message
-                        );
+                            message, generation,
+                        ).catch(error => captureFailure(normalizeServiceError(error)));
 
                     } catch {
                         // Ignora saída não JSON.
@@ -481,76 +608,65 @@ export class SpeechToTextService {
         );
 
 
-        await this.waitForCapture();
+        await this.waitForCapture(signal, generation);
     }
 
 
-    private async waitForWhisper(): Promise<void> {
-        const deadline =
-            Date.now() + 60_000;
+    private async probeWhisper(signal?: AbortSignal): Promise<boolean> {
+        return timedServiceOperation(async requestSignal => {
+            const response = await (this.options.fetch ?? fetch)(
+                `http://127.0.0.1:${this.whisperPort}/`, { signal: requestSignal },
+            );
+            void response.body?.cancel().catch(() => undefined);
+            requestSignal.throwIfAborted();
+            return response.ok;
+        }, { signal, timeoutMs: this.options.healthTimeoutMs ?? 1_500, label: "Whisper health" });
+    }
 
-        while (Date.now() < deadline) {
-            try {
-                const response = await fetch(
-                    `http://127.0.0.1:${this.whisperPort}/`
-                );
-
-                if (response.ok) {
-                    return;
+    private async waitForWhisper(signal: AbortSignal): Promise<void> {
+        await timedServiceOperation(async startupSignal => {
+            while (true) {
+                startupSignal.throwIfAborted();
+                try {
+                    if (await this.probeWhisper(startupSignal)) return;
+                } catch {
+                    startupSignal.throwIfAborted();
+                    // Ainda carregando o modelo; a tentativa HTTP também é limitada.
                 }
-
-            } catch {
-                // Ainda carregando o modelo.
+                await delay(this.options.pollIntervalMs ?? 250, undefined, { signal: startupSignal });
             }
-
-            await new Promise(
-                (resolve) =>
-                    setTimeout(
-                        resolve,
-                        250,
-                    )
-            );
-        }
-
-        throw new Error(
-            "Whisper Server não iniciou dentro do tempo esperado."
-        );
+        }, { signal, timeoutMs: this.options.whisperStartupTimeoutMs ?? 60_000, label: "Whisper startup" });
     }
 
-
-    private async waitForCapture(): Promise<void> {
-        const deadline =
-            Date.now() + 10_000;
-
-        while (Date.now() < deadline) {
-            if (this.captureReady) {
-                return;
-            }
-
-            await new Promise(
-                (resolve) =>
-                    setTimeout(
-                        resolve,
-                        50,
-                    )
-            );
+    private async waitForCapture(signal: AbortSignal, generation: number): Promise<void> {
+        if (this.captureReady) return;
+        try {
+            await timedServiceOperation(() => new Promise<void>(resolve => {
+                this.captureReadyResolver = resolve;
+                if (this.captureReady) resolve();
+            }), { signal, timeoutMs: this.options.captureStartupTimeoutMs ?? 10_000, label: "Captura startup" });
+        } finally {
+            if (generation === this.generation) this.captureReadyResolver = null;
         }
-
-        throw new Error(
-            "Serviço de captura de áudio não iniciou."
-        );
     }
 
 
     private async handleCaptureMessage(
         message: CaptureMessage,
+        generation: number,
     ): Promise<void> {
+        if (generation !== this.generation || this.sessionFailed || !this.captureProcess) return;
         if (
             message.type ===
             "ready"
         ) {
             this.captureReady =
                 true;
+            if (!this.restorePlaybackState()) {
+                this.failSession(new Error("A captura não recebeu o estado acústico de playback."), generation);
+                return;
+            }
+            this.captureReadyResolver?.();
 
             debugLog("[STT] Captura pronta:", {
                 detector: message.detector ?? "rms",
@@ -583,7 +699,7 @@ export class SpeechToTextService {
                 const listener
                 of this.speechStartListeners
             ) {
-                listener();
+                try { listener(); } catch { /* Observer isolation. */ }
             }
 
             return;
@@ -617,11 +733,7 @@ export class SpeechToTextService {
                     ?? "Erro desconhecido na captura."
                 );
 
-            this.pendingReject?.(
-                error
-            );
-
-            this.clearPending();
+            this.failSession(error, generation);
 
             return;
         }
@@ -631,17 +743,41 @@ export class SpeechToTextService {
             "audio"
             && message.path
         ) {
+            const listenId = this.listenId;
+            const listenController = this.listenController;
+            if (!listenController || !this.pendingResolve) {
+                if (this.activeTranscription?.path !== message.path) {
+                    await unlink(message.path).catch(() => undefined);
+                }
+                return;
+            }
+            // One WAV belongs to one listen. Late/duplicate capture events must
+            // not transcribe twice or resolve a newer utterance after cancellation.
+            if (this.activeTranscription?.listenId === listenId
+                && this.activeTranscription.generation === generation) {
+                if (this.activeTranscription.path !== message.path) {
+                    await unlink(message.path).catch(() => undefined);
+                }
+                return;
+            }
+            const active = { generation, listenId, path: message.path };
+            this.activeTranscription = active;
+            const ownsListen = (): boolean => generation === this.generation
+                && listenId === this.listenId && this.listenController === listenController
+                && !listenController.signal.aborted;
             if (!this.speechEndDelivered) {
                 this.emitSpeechEnd(message.endpoint);
             }
-            for (const listener of this.transcriptionStartListeners) listener();
+            for (const listener of this.transcriptionStartListeners) {
+                try { listener(); } catch { /* Observer isolation. */ }
+            }
 
             try {
                 const text =
                     await this.transcribe(
-                        message.path
+                        message.path, listenController.signal,
                     );
-
+                if (!ownsListen()) return;
 
                 if (!text) {
                     this.sendCapture({
@@ -659,33 +795,37 @@ export class SpeechToTextService {
                 this.clearPending();
 
             } catch (error) {
-                const normalizedError =
-                    error instanceof Error
-                        ? error
-                        : new Error(
-                            String(error)
-                        );
-
-
-                this.pendingReject?.(
-                    normalizedError
-                );
-
-
+                if (!ownsListen()) return;
+                const normalizedError = normalizeServiceError(error);
+                if ("code" in normalizedError && normalizedError.code === "ETIMEDOUT") {
+                    // HTTP cancellation alone does not guarantee that Whisper
+                    // stopped a stalled decode. Retire this owned session before
+                    // the supervisor can attempt a bounded fresh start.
+                    this.failSession(normalizedError, generation);
+                    return;
+                }
+                this.pendingReject?.(normalizedError);
                 this.clearPending();
             } finally {
-                for (const listener of this.transcriptionEndListeners) listener();
+                if (this.activeTranscription === active) {
+                    this.activeTranscription = null;
+                    for (const listener of this.transcriptionEndListeners) {
+                        try { listener(); } catch { /* Observer isolation. */ }
+                    }
+                }
             }
         }
     }
 
 
     private async transcribe(
-        audioPath: string
+        audioPath: string,
+        signal: AbortSignal,
     ): Promise<string> {
         try {
+            return await timedServiceOperation(async requestSignal => {
             const audio = await readFile(
-                audioPath
+                audioPath, { signal: requestSignal },
             );
 
             const form = new FormData();
@@ -746,11 +886,12 @@ export class SpeechToTextService {
 
             const response = await perf.measure(
                 "STT transcription",
-                () => fetch(
+                () => (this.options.fetch ?? fetch)(
                     this.whisperUrl,
                     {
                         method: "POST",
                         body: form,
+                        signal: requestSignal,
                     },
                 ),
             );
@@ -768,6 +909,7 @@ export class SpeechToTextService {
 
             const text =
                 await response.text();
+            requestSignal.throwIfAborted();
             const transcription = text.trim();
 
             if (transcription) {
@@ -777,7 +919,7 @@ export class SpeechToTextService {
             }
 
             return transcription;
-
+            }, { signal, timeoutMs: this.options.transcriptionTimeoutMs ?? 60_000, label: "STT transcription" });
         } finally {
             await unlink(
                 audioPath
@@ -788,8 +930,9 @@ export class SpeechToTextService {
     }
 
 
-    listen(): Promise<string> {
-        if (!this.captureProcess) {
+    listen(signal?: AbortSignal): Promise<string> {
+        if (signal?.aborted) return Promise.reject(signal.reason);
+        if (!this.isReady()) {
             return Promise.reject(
                 new Error(
                     "Serviço STT não iniciado."
@@ -807,7 +950,10 @@ export class SpeechToTextService {
         }
 
 
-        return new Promise<string>(
+        const listenController = new AbortController();
+        this.listenController = listenController;
+        const listenId = ++this.listenId;
+        const task = new Promise<string>(
             (resolve, reject) => {
                 this.pendingResolve =
                     resolve;
@@ -815,11 +961,25 @@ export class SpeechToTextService {
                 this.pendingReject =
                     reject;
 
-                this.sendCapture({
+                const abort = (): void => {
+                    if (this.listenId !== listenId || this.listenController !== listenController) return;
+                    this.rejectPending(normalizeServiceError(signal?.reason
+                        ?? new DOMException("Escuta cancelada.", "AbortError")));
+                    this.pause();
+                };
+                signal?.addEventListener("abort", abort, { once: true });
+                this.removeListenAbort = () => signal?.removeEventListener("abort", abort);
+                if (signal?.aborted) {
+                    abort();
+                    return;
+                }
+                if (!this.sendCapture({
                     type: "resume",
-                });
+                })) this.rejectPending(new Error("Captura de áudio indisponível."));
             },
         );
+        void task.catch(() => undefined);
+        return task;
     }
 
 
@@ -837,6 +997,8 @@ export class SpeechToTextService {
     }
 
     setPlaybackActive(active: boolean): void {
+        this.playbackActive = active;
+        if (!active) this.playbackReference = null;
         this.sendCapture({
             type: "playback",
             active,
@@ -844,6 +1006,7 @@ export class SpeechToTextService {
     }
 
     startPlaybackReference(reference: PlaybackReference): void {
+        this.playbackReference = { ...reference };
         this.sendCapture({
             type: "playback_reference_start",
             path: reference.path,
@@ -853,8 +1016,28 @@ export class SpeechToTextService {
     }
 
     endPlaybackReference(reference: PlaybackReference): void {
+        const current = this.playbackReference;
+        if (current?.path === reference.path && current.generation === reference.generation
+            && current.startedAtUnixMs === reference.startedAtUnixMs) {
+            this.playbackReference = null;
+        }
         this.sendCapture({
             type: "playback_reference_end",
+            path: reference.path,
+            generation: reference.generation,
+            startedAtUnixMs: reference.startedAtUnixMs,
+        });
+    }
+
+    private restorePlaybackState(): boolean {
+        // This runs inside the ready handler, before the startup promise can
+        // resolve and any consumer can resume listening. Replaying only the
+        // current snapshot cannot resurrect a reference ended while offline.
+        if (this.playbackActive !== null
+            && !this.sendCapture({ type: "playback", active: this.playbackActive })) return false;
+        const reference = this.playbackReference;
+        return !reference || this.sendCapture({
+            type: "playback_reference_start",
             path: reference.path,
             generation: reference.generation,
             startedAtUnixMs: reference.startedAtUnixMs,
@@ -864,19 +1047,22 @@ export class SpeechToTextService {
 
     private sendCapture(
         message: object
-    ): void {
+    ): boolean {
         if (
             !this.captureProcess
             || this.captureProcess.killed
+            || this.captureProcess.stdin.writable === false
         ) {
-            return;
+            return false;
         }
 
-        this.captureProcess.stdin.write(
-            JSON.stringify(
-                message
-            ) + "\n"
-        );
+        try {
+            this.captureProcess.stdin.write(JSON.stringify(message) + "\n");
+            return true;
+        } catch (error) {
+            this.failSession(normalizeServiceError(error), this.generation);
+            return false;
+        }
     }
 
 
@@ -895,30 +1081,65 @@ export class SpeechToTextService {
             });
         }
 
-        for (const listener of this.speechEndListeners) listener(metrics);
+        for (const listener of this.speechEndListeners) {
+            try { listener(metrics); } catch { /* Observer isolation. */ }
+        }
     }
 
 
     private clearPending(): void {
+        this.removeListenAbort?.();
+        this.removeListenAbort = null;
+        this.listenController = null;
         this.pendingResolve = null;
         this.pendingReject = null;
     }
 
+    private rejectPending(error: Error): void {
+        this.listenController?.abort(error);
+        this.pendingReject?.(error);
+        this.clearPending();
+    }
 
-    stop(): void {
-        this.sendCapture({
-            type: "stop",
-        });
+    private failSession(error: Error, generation: number): void {
+        if (generation !== this.generation || this.sessionFailed) return;
+        this.sessionFailed = true;
+        this.lifecycle?.abort(error);
+        this.rejectPending(error);
+        this.terminateProcesses();
+        for (const listener of this.failureListeners) {
+            try { listener(error); } catch { /* Observer isolation. */ }
+        }
+    }
 
-        this.captureProcess?.kill();
-        this.whisperProcess?.kill();
-
+    private terminateProcesses(): void {
+        const capture = this.captureProcess;
+        const whisper = this.whisperProcess;
+        // Release ownership before kill: close/EPIPE from an old generation must
+        // never clear a replacement process or reject its pending listen.
         this.captureProcess = null;
         this.whisperProcess = null;
-
+        this.ready = false;
         this.captureReady = false;
+        this.captureReadyResolver = null;
+        this.activeTranscription = null;
         this.speechEndDelivered = false;
+        try {
+            if (capture && !capture.killed && capture.stdin.writable !== false) {
+                capture.stdin.write(`${JSON.stringify({ type: "stop" })}\n`);
+            }
+        } catch { /* Best effort before terminating our own child. */ }
+        try { capture?.kill(); } catch { /* Process may have already exited. */ }
+        try { whisper?.kill(); } catch { /* Process may have already exited. */ }
+    }
 
-        this.clearPending();
+    stop(): void {
+        ++this.generation;
+        const error = new DOMException("Serviço STT encerrado.", "AbortError");
+        this.lifecycle?.abort(error);
+        this.lifecycle = null;
+        this.rejectPending(error);
+        this.terminateProcesses();
+        this.startupPromise = null;
     }
 }

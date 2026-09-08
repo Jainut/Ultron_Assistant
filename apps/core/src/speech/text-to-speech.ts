@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
 import path from "node:path";
 import { servicePath } from "../config/runtime.ts";
+import { awaitServiceOperation, serviceError as normalizeServiceError, timedServiceOperation } from "../system/service-lifecycle.ts";
 import { serviceError } from "../utils/debug.ts";
 import { perf } from "../utils/performance.ts";
 import {
@@ -97,6 +98,12 @@ export interface TextToSpeechServiceOptions {
     /** Allows lifecycle tests without loading Kokoro or opening an audio device. */
     spawnService?: typeof spawn;
     startupTimeoutMs?: number;
+    synthesisTimeoutMs?: number;
+    playbackTimeoutMs?: number;
+    playbackCancelTimeoutMs?: number;
+    /** Isolated fallback tests must never launch a real audio player. */
+    playFallback?: typeof playAudioFallback;
+    stopFallback?: typeof stopAudioFallback;
     /** Diagnostics need player-confirmed timestamps, not the legacy estimate. */
     requirePersistentPlayback?: boolean;
 }
@@ -107,6 +114,8 @@ interface PendingPlayback extends PlaybackCallbacks {
     removeAbortListener?: () => void;
     abortReason?: unknown;
     started: boolean;
+    cancelRequested?: boolean;
+    fallbackSafe?: boolean;
 }
 
 const ttsRoot = servicePath("tts-kokoro");
@@ -136,6 +145,12 @@ export class TextToSpeechService {
 
     private ready = false;
     private persistentPlaybackAvailable = false;
+    private readonly failureListeners = new Set<(error: Error) => void>();
+    private failCurrentProcess: ((error: Error) => void) | null = null;
+    private readonly deadlines = new Map<string, NodeJS.Timeout>();
+    private readonly cancelledSynthesis = new Set<string>();
+    private readonly pendingFlushes = new Set<string>();
+    private readonly fallbackControllers = new Set<AbortController>();
 
     private readonly pending = new Map<
         string,
@@ -146,13 +161,30 @@ export class TextToSpeechService {
 
     constructor(private readonly options: TextToSpeechServiceOptions = {}) {}
 
-    start(): Promise<void> {
-        if (this.child && this.ready) {
+    isReady(): boolean {
+        return Boolean(this.child && !this.child.killed && this.ready);
+    }
+
+    onFailure(listener: (error: Error) => void): () => void {
+        this.failureListeners.add(listener);
+        return () => this.failureListeners.delete(listener);
+    }
+
+    async healthCheck(signal?: AbortSignal): Promise<boolean> {
+        signal?.throwIfAborted();
+        // The existing JSON protocol has no ping. Report only owned-process
+        // readiness; do not claim that this probes a busy/hung synthesis engine.
+        return this.isReady();
+    }
+
+    start(signal?: AbortSignal): Promise<void> {
+        if (signal?.aborted) return Promise.reject(signal.reason);
+        if (this.isReady()) {
             return Promise.resolve();
         }
 
         if (this.startupPromise) {
-            return this.startupPromise;
+            return signal ? awaitServiceOperation(this.startupPromise, signal) : this.startupPromise;
         }
 
         const startupPromise = new Promise<void>((resolve, reject) => {
@@ -160,7 +192,10 @@ export class TextToSpeechService {
             let startupTimeout: NodeJS.Timeout | undefined;
 
             const clearStartup = (): void => {
-                if (startupTimeout) clearTimeout(startupTimeout);
+                if (startupTimeout) {
+                    clearTimeout(startupTimeout);
+                    startupTimeout = undefined;
+                }
                 if (this.rejectStartup === rejectStartup) this.rejectStartup = null;
             };
 
@@ -213,7 +248,7 @@ export class TextToSpeechService {
             });
 
             child.stderr.on("data", (chunk: Buffer) => {
-                serviceError("[Kokoro]", chunk.toString());
+                if (this.child === child) serviceError("[Kokoro]", chunk.toString());
             });
 
             const handleProcessError = (error: Error): void => {
@@ -221,6 +256,9 @@ export class TextToSpeechService {
                     this.ready = false;
                     this.persistentPlaybackAvailable = false;
                     this.child = null;
+                    this.failCurrentProcess = null;
+                    this.clearDeadlines();
+                    this.cancelFallbacks(error);
 
                     for (const request of this.pending.values()) {
                         request.removeAbortListener?.();
@@ -233,13 +271,20 @@ export class TextToSpeechService {
                         playback.reject(error);
                     }
                     this.pendingPlayback.clear();
-                    child.kill();
+                    try { child.kill(); } catch { /* Already exited. */ }
+                    this.notifyFailure(error);
                 }
                 rejectStartup(error);
             };
+            this.failCurrentProcess = handleProcessError;
             child.once("error", handleProcessError);
+            child.once("exit", code => handleProcessError(new Error(
+                `O serviço Kokoro encerrou com código ${code}.`,
+            )));
             // EPIPE can arrive on stdin without a child-process error/close.
             child.stdin.on("error", handleProcessError);
+            child.stdout.on("error", handleProcessError);
+            child.stderr.on("error", handleProcessError);
 
             const configuredTimeout = this.options.startupTimeoutMs ?? 180_000;
             const timeoutMs = Number.isFinite(configuredTimeout) && configuredTimeout > 0
@@ -254,6 +299,8 @@ export class TextToSpeechService {
                     this.ready = false;
                     this.persistentPlaybackAvailable = false;
                     this.child = null;
+                    this.failCurrentProcess = null;
+                    this.clearDeadlines();
                 }
 
                 const error = new Error(
@@ -265,6 +312,7 @@ export class TextToSpeechService {
                 }
 
                 if (ownsCurrentProcess) {
+                    this.cancelFallbacks(error);
                     for (const request of this.pending.values()) {
                         request.removeAbortListener?.();
                         request.reject(error);
@@ -277,18 +325,64 @@ export class TextToSpeechService {
                         playback.reject(error);
                     }
                     this.pendingPlayback.clear();
+                    this.notifyFailure(error);
                 }
             });
         });
 
         this.startupPromise = startupPromise;
+        const abort = (): void => {
+            if (this.startupPromise === startupPromise && !this.ready) {
+                this.stop(normalizeServiceError(signal?.reason
+                    ?? new DOMException("Inicialização TTS cancelada.", "AbortError")));
+            }
+        };
+        signal?.addEventListener("abort", abort, { once: true });
+        if (signal?.aborted) abort();
         const clearStartupPromise = (): void => {
+            signal?.removeEventListener("abort", abort);
             if (this.startupPromise === startupPromise) {
                 this.startupPromise = null;
             }
         };
         void startupPromise.then(clearStartupPromise, clearStartupPromise);
         return startupPromise;
+    }
+
+    private notifyFailure(error: Error): void {
+        for (const listener of this.failureListeners) {
+            try { listener(error); } catch { /* Observer isolation. */ }
+        }
+    }
+
+    private duration(configured: number | undefined, fallback: number): number {
+        return configured !== undefined && Number.isFinite(configured) && configured > 0
+            ? configured : fallback;
+    }
+
+    private armDeadline(id: string, label: string, timeoutMs: number): void {
+        this.disarmDeadline(id);
+        const child = this.child;
+        if (!child) return;
+        this.deadlines.set(id, setTimeout(() => {
+            this.deadlines.delete(id);
+            if (this.child !== child) return;
+            const error = Object.assign(new Error(`${label}: tempo limite excedido.`), { code: "ETIMEDOUT" });
+            this.failCurrentProcess?.(error);
+        }, timeoutMs));
+    }
+
+    private disarmDeadline(id: string): void {
+        const timer = this.deadlines.get(id);
+        if (timer) clearTimeout(timer);
+        this.deadlines.delete(id);
+    }
+
+    private clearDeadlines(): void {
+        for (const timer of this.deadlines.values()) clearTimeout(timer);
+        this.deadlines.clear();
+        this.cancelledSynthesis.clear();
+        this.pendingFlushes.clear();
     }
 
     private handleMessage(
@@ -332,6 +426,23 @@ export class TextToSpeechService {
             return;
         }
 
+        if (this.pendingFlushes.has(message.id)) {
+            if (message.type === "playback_flushed") {
+                this.pendingFlushes.delete(message.id);
+                this.disarmDeadline(message.id);
+            } else if (message.type === "error") {
+                this.failCurrentProcess?.(new Error("O player não confirmou o flush de áudio."));
+            }
+            return;
+        }
+        if (this.cancelledSynthesis.has(message.id)) {
+            if (message.type === "audio_ready" || message.type === "error") {
+                this.cancelledSynthesis.delete(message.id);
+                this.disarmDeadline(message.id);
+            }
+            return;
+        }
+
         const playback = this.pendingPlayback.get(message.id);
         if (playback !== undefined) {
             this.handlePlaybackMessage(message.id, message, playback);
@@ -342,11 +453,8 @@ export class TextToSpeechService {
         if (!request) return;
 
         this.pending.delete(message.id);
+        this.disarmDeadline(message.id);
         request.removeAbortListener?.();
-
-        const elapsed =
-            (performance.now() - request.startedAt) / 1000;
-
 
         if (message.type === "audio_ready" && message.path) {
             request.resolve(message.path);
@@ -381,9 +489,13 @@ export class TextToSpeechService {
         }
 
         this.pendingPlayback.delete(id);
+        this.disarmDeadline(id);
         playback.removeAbortListener?.();
 
         if (message.type === "error") {
+            // Only an explicit backend refusal before any start/cancel is safe
+            // to replay on the legacy player. Missing ACK/timeout is ambiguous.
+            playback.fallbackSafe = !playback.started && !playback.cancelRequested;
             playback.reject(new Error(
                 message.error ?? "O player persistente não conseguiu reproduzir o áudio.",
             ));
@@ -439,10 +551,13 @@ export class TextToSpeechService {
                 }
 
                 this.pending.delete(id);
-                this.child?.stdin.write(`${JSON.stringify({
-                    id,
-                    type: "cancel",
-                })}\n`);
+                request.removeAbortListener?.();
+                // Synthesis cancellation is cooperative in Kokoro; retain its
+                // original bounded deadline until Python confirms the terminal
+                // result, rather than killing a valid model mid-kernel in 1s.
+                this.cancelledSynthesis.add(id);
+                try { this.writeMessage({ id, type: "cancel" }); }
+                catch (error) { this.failCurrentProcess?.(normalizeServiceError(error)); }
                 reject(new DOMException("Síntese cancelada.", "AbortError"));
             };
             const removeAbortListener = signal
@@ -455,8 +570,13 @@ export class TextToSpeechService {
                 startedAt: performance.now(),
                 removeAbortListener,
             });
+            this.armDeadline(id, "TTS synthesis", this.duration(this.options.synthesisTimeoutMs, 60_000));
 
             signal?.addEventListener("abort", abort, { once: true });
+            if (signal?.aborted) {
+                abort();
+                return;
+            }
 
             const message = {
                 id,
@@ -465,9 +585,14 @@ export class TextToSpeechService {
                 output: audioPath,
             };
 
-            this.child?.stdin.write(
-                `${JSON.stringify(message)}\n`,
-            );
+            try { this.writeMessage(message); }
+            catch (error) {
+                this.failCurrentProcess?.(normalizeServiceError(error));
+                this.pending.delete(id);
+                this.disarmDeadline(id);
+                removeAbortListener?.();
+                reject(error);
+            }
         });
     }
 
@@ -498,9 +623,12 @@ export class TextToSpeechService {
                     const playback = this.pendingPlayback.get(id);
                     if (playback === undefined) return;
                     if (playback.abortReason !== undefined) return;
+                    playback.cancelRequested = true;
                     playback.abortReason = options.signal?.reason
                         ?? new DOMException("Playback cancelado.", "AbortError");
-                    this.writeMessage({ id, type: "cancel_playback" });
+                    this.armDeadline(id, "TTS cancel ACK", this.duration(this.options.playbackCancelTimeoutMs, 1_500));
+                    try { this.writeMessage({ id, type: "cancel_playback" }); }
+                    catch (error) { this.failCurrentProcess?.(normalizeServiceError(error)); }
                 };
                 const removeAbortListener = options.signal
                     ? (): void => options.signal?.removeEventListener("abort", abort)
@@ -516,6 +644,7 @@ export class TextToSpeechService {
                     started: false,
                 };
                 this.pendingPlayback.set(id, playbackState);
+                this.armDeadline(id, "TTS playback", this.duration(this.options.playbackTimeoutMs, 120_000));
 
                 try {
                     this.writeMessage({ id, type: "play", path: audioPath });
@@ -523,6 +652,7 @@ export class TextToSpeechService {
                     if (options.signal?.aborted) abort();
                 } catch (error) {
                     this.pendingPlayback.delete(id);
+                    this.disarmDeadline(id);
                     removeAbortListener?.();
                     reject(error);
                 }
@@ -532,6 +662,7 @@ export class TextToSpeechService {
             // tentar o SoundPlayer legado sem duplicar áudio já iniciado.
             if (
                 playbackState !== undefined
+                && playbackState.fallbackSafe === true
                 && !playbackState.started
                 && playbackState.abortReason === undefined
                 && !this.options.requirePersistentPlayback
@@ -545,19 +676,34 @@ export class TextToSpeechService {
 
     /** Cancela o áudio atual e qualquer item já enfileirado no player Python. */
     stopPlayback(): void {
+        this.cancelFallbacks(new DOMException("Playback cancelado.", "AbortError"));
         if (!this.persistentPlaybackAvailable || !this.child) {
-            stopAudioFallback();
+            (this.options.stopFallback ?? stopAudioFallback)();
             return;
         }
 
         try {
+            const timeoutMs = this.duration(this.options.playbackCancelTimeoutMs, 1_500);
+            for (const [id, playback] of this.pendingPlayback) {
+                // Preserve legacy resolution on playback_cancelled for callers
+                // without an AbortSignal, but never replay a cancelled request.
+                if (!playback.cancelRequested) {
+                    playback.cancelRequested = true;
+                    this.armDeadline(id, "TTS flush terminal ACK", timeoutMs);
+                }
+            }
+            const flushId = randomUUID();
+            this.pendingFlushes.add(flushId);
+            this.armDeadline(flushId, "TTS flush ACK", timeoutMs);
             this.writeMessage({
-                id: randomUUID(),
+                id: flushId,
                 type: "flush_playback",
             });
         } catch (error) {
+            this.failCurrentProcess?.(normalizeServiceError(error));
             for (const [id, playback] of this.pendingPlayback) {
                 this.pendingPlayback.delete(id);
+                this.disarmDeadline(id);
                 playback.removeAbortListener?.();
                 playback.reject(error);
             }
@@ -573,24 +719,43 @@ export class TextToSpeechService {
         options: PlaybackOptions,
     ): Promise<void> {
         let aborted = false;
-        const abort = (): void => {
-            aborted = true;
-            stopAudioFallback();
-        };
-        options.signal?.addEventListener("abort", abort, { once: true });
-        if (options.signal?.aborted) abort();
+        const child = this.child;
+        const controller = new AbortController();
+        this.fallbackControllers.add(controller);
+        const signal = options.signal
+            ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
         try {
-            options.onStarted?.();
-            await playAudioFallback(audioPath);
-            if (aborted) {
-                options.onCancelled?.();
-                throw options.signal?.reason
-                    ?? new DOMException("Playback cancelado.", "AbortError");
-            }
+            await timedServiceOperation(async signal => {
+                const abort = (): void => {
+                    aborted = true;
+                    (this.options.stopFallback ?? stopAudioFallback)();
+                };
+                signal.addEventListener("abort", abort, { once: true });
+                try {
+                    signal.throwIfAborted();
+                    options.onStarted?.();
+                    await awaitServiceOperation((this.options.playFallback ?? playAudioFallback)(audioPath), signal);
+                } finally {
+                    signal.removeEventListener("abort", abort);
+                }
+            }, { signal,
+                timeoutMs: this.duration(this.options.playbackTimeoutMs, 120_000), label: "TTS fallback playback" });
             options.onFinished?.();
+        } catch (error) {
+            if (aborted) options.onCancelled?.();
+            if (controller.signal.aborted && error instanceof DOMException
+                && error.name === "AbortError" && !options.signal?.aborted) return;
+            if (aborted && !signal.aborted && this.child === child) {
+                this.failCurrentProcess?.(normalizeServiceError(error));
+            }
+            throw error;
         } finally {
-            options.signal?.removeEventListener("abort", abort);
+            this.fallbackControllers.delete(controller);
         }
+    }
+
+    private cancelFallbacks(error: Error): void {
+        for (const controller of this.fallbackControllers) controller.abort(error);
     }
 
     private writeMessage(message: Record<string, unknown>): void {
@@ -600,11 +765,12 @@ export class TextToSpeechService {
         this.child.stdin.write(`${JSON.stringify(message)}\n`);
     }
 
-    stop(): void {
-        const error = new Error("O serviço de voz foi encerrado.");
+    stop(error: Error = new Error("O serviço de voz foi encerrado.")): void {
+        this.cancelFallbacks(error);
         this.rejectStartup?.(error);
         this.startupPromise = null;
         if (!this.child) {
+            this.clearDeadlines();
             return;
         }
 
@@ -621,10 +787,13 @@ export class TextToSpeechService {
             playback.reject(error);
         }
         this.pendingPlayback.clear();
-        this.child.stdin.end();
-        this.child.kill();
+        const child = this.child;
         this.child = null;
+        this.failCurrentProcess = null;
+        this.clearDeadlines();
         this.ready = false;
         this.persistentPlaybackAvailable = false;
+        try { child.stdin.end(); } catch { /* Already closed. */ }
+        try { child.kill(); } catch { /* Already exited. */ }
     }
 }

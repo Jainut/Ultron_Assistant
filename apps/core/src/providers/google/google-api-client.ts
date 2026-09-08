@@ -2,6 +2,8 @@ import type {
     AccessTokenOptions,
     FetchTransport,
 } from "../../security/oauth2-desktop.ts";
+import { setTimeout as wait } from "node:timers/promises";
+import { awaitServiceOperation } from "../../system/service-lifecycle.ts";
 import {
     ProviderAuthenticationError,
     ProviderError,
@@ -24,6 +26,12 @@ export interface AccessTokenSource {
     getAccessToken(options?: AccessTokenOptions): Promise<string>;
 }
 
+export interface GoogleApiClientOptions {
+    readonly timeoutMs?: number;
+    readonly readRetries?: number;
+    readonly retryDelayMs?: number;
+}
+
 export class GoogleApiClient {
     private readonly providerId: string;
     private readonly baseUrl: URL;
@@ -35,6 +43,7 @@ export class GoogleApiClient {
         baseUrl: string,
         oauth: AccessTokenSource,
         transport: FetchTransport = globalThis.fetch,
+        private readonly options: GoogleApiClientOptions = {},
     ) {
         this.providerId = providerId;
         this.baseUrl = new URL(baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`);
@@ -44,12 +53,38 @@ export class GoogleApiClient {
 
     async request<T>(path: string, request: GoogleApiRequest = {}): Promise<T> {
         request.signal?.throwIfAborted();
-        return await this.performRequest<T>(path, request, false);
+        const configured = this.options.timeoutMs ?? Number(process.env.ULTRON_PROVIDER_TIMEOUT_MS || 15_000);
+        const timeoutMs = Number.isFinite(configured) && configured > 0 ? Math.min(configured, 60_000) : 15_000;
+        const deadline = new AbortController();
+        const timer = setTimeout(() => deadline.abort(new DOMException("O provider excedeu o tempo limite.", "TimeoutError")), timeoutMs);
+        const signal = request.signal ? AbortSignal.any([request.signal, deadline.signal]) : deadline.signal;
+        // Retry only reads. A timeout/5xx after a POST does not prove that the
+        // email/event/task was not created, so mutations are never replayed here.
+        const configuredRetries = this.options.readRetries ?? 1;
+        const retries = (request.method ?? "GET") === "GET"
+            ? (Number.isFinite(configuredRetries) ? Math.min(2, Math.max(0, Math.floor(configuredRetries))) : 1) : 0;
+        try {
+            for (let attempt = 0; ; attempt += 1) {
+                signal.throwIfAborted();
+                try {
+                    return await this.performRequest<T>(path, { ...request, signal }, false);
+                } catch (error) {
+                    signal.throwIfAborted();
+                    if (!(error instanceof ProviderError) || !error.retryable || attempt >= retries) throw error;
+                    const delay = Math.max(this.options.retryDelayMs ?? 200, error.retryAfterMs ?? 0);
+                    // Never disregard a longer Retry-After by clamping it down.
+                    if (delay > 2_000) throw error;
+                    await wait(delay, undefined, { signal });
+                }
+            }
+        } finally {
+            clearTimeout(timer);
+        }
     }
 
     private async performRequest<T>(
         path: string,
-        request: GoogleApiRequest,
+        request: GoogleApiRequest & { signal: AbortSignal },
         retriedAuthentication: boolean,
     ): Promise<T> {
         const tokenOptions: AccessTokenOptions = {
@@ -58,12 +93,19 @@ export class GoogleApiClient {
         };
         let accessToken: string;
         try {
-            accessToken = await this.oauth.getAccessToken(tokenOptions);
+            accessToken = await awaitServiceOperation(this.oauth.getAccessToken(tokenOptions), request.signal);
         } catch (error) {
+            request.signal?.throwIfAborted();
             throw new ProviderAuthenticationError(this.providerId, error);
         }
+        request.signal.throwIfAborted();
 
         const url = new URL(path.replace(/^\/+/, ""), this.baseUrl);
+        if (url.origin !== this.baseUrl.origin || !url.pathname.startsWith(this.baseUrl.pathname)) {
+            throw new ProviderError("Caminho fora do endpoint permitido do provider.", {
+                providerId: this.providerId, code: "validation",
+            });
+        }
         for (const [key, value] of Object.entries(request.query ?? {})) {
             if (Array.isArray(value)) {
                 for (const item of value) url.searchParams.append(key, item);
@@ -83,12 +125,12 @@ export class GoogleApiClient {
 
         let response: Response;
         try {
-            response = await this.transport(url, {
+            response = await awaitServiceOperation(this.transport(url, {
                 method: request.method ?? "GET",
                 headers,
                 body,
                 signal: request.signal,
-            });
+            }), request.signal);
         } catch (error) {
             if (request.signal?.aborted) throw request.signal.reason;
             throw new ProviderError(`Falha de rede ao acessar ${this.providerId}.`, {
@@ -98,6 +140,7 @@ export class GoogleApiClient {
                 cause: error,
             });
         }
+        request.signal.throwIfAborted();
 
         if (response.status === 401 && !retriedAuthentication) {
             return await this.performRequest<T>(path, request, true);
@@ -112,8 +155,9 @@ export class GoogleApiClient {
         if (!contentType.includes("json")) return undefined as T;
 
         try {
-            return await response.json() as T;
+            return await awaitServiceOperation(response.json(), request.signal) as T;
         } catch (error) {
+            request.signal?.throwIfAborted();
             throw new ProviderError(`Resposta inválida recebida de ${this.providerId}.`, {
                 providerId: this.providerId,
                 code: "remote_error",
@@ -139,13 +183,16 @@ function providerErrorFromResponse(providerId: string, response: Response): Prov
                 status: response.status,
             });
         case 429: {
-            const retryAfter = Number(response.headers.get("retry-after"));
+            const header = response.headers.get("retry-after");
+            const seconds = header === null ? Number.NaN : Number(header);
+            const retryAfterMs = Number.isFinite(seconds) ? Math.max(0, seconds * 1_000)
+                : header ? Math.max(0, Date.parse(header) - Date.now()) : undefined;
             return new ProviderError(`Limite de requisições atingido em ${providerId}.`, {
                 providerId,
                 code: "rate_limit",
                 status: response.status,
                 retryable: true,
-                retryAfterMs: Number.isFinite(retryAfter) ? retryAfter * 1_000 : undefined,
+                retryAfterMs: Number.isFinite(retryAfterMs) ? retryAfterMs : undefined,
             });
         }
         default:

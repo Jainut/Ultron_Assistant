@@ -19,8 +19,15 @@ import {
     stopAutomaticDeviceDiscovery,
 } from "./automation/device-discovery.ts";
 import { FastIntentRouter } from "./intent/fast-intent-router.ts";
-import { startLightService, stopLightService } from "../tools/light.tool.ts";
+import { stopLightService } from "../tools/light.tool.ts";
+import { tuyaCloudClient, tuyaHomeClient } from "./automation/tuya-cloud-client.ts";
+import { personalProviderRuntime } from "./tools/core-tool-registry.ts";
+import { createCoreSupervision, startCoreServices } from "./system/core-supervision.ts";
+import { checkLocalOllamaHealth, publicServiceHealth, runtimeHealthSummary, waitForServiceReady } from "./system/runtime-health.ts";
+import { TerminalInput } from "./system/terminal-input.ts";
+import { runtimeConfig } from "./config/runtime.ts";
 import {
+    automationEngine,
     registerToolActions,
     startAutomationRuntime,
     stopAutomationRuntime,
@@ -44,6 +51,22 @@ const hud = new HudServer();
 const fastRouter = new FastIntentRouter(parseDirectAutomationCommand);
 const lifecycleController = new AbortController();
 const conversationId = randomUUID();
+const terminalInput = new TerminalInput();
+const { supervisor, backgroundServices } = createCoreSupervision({
+    stt, tts, tuya: tuyaCloudClient, tuyaHome: tuyaHomeClient,
+    legacyLightProcess: process.env.ULTRON_TUYA_LEGACY_PROCESS === "1",
+    discoveryDisabled: process.env.ULTRON_DISABLE_DISCOVERY === "1",
+    automation: {
+        start: startAutomationRuntime, stop: stopAutomationRuntime,
+        isRunning: () => automationEngine.scheduler.isRunning,
+    },
+    ollamaHealth: signal => checkLocalOllamaHealth(runtimeConfig.ollamaModel, signal),
+    providers: {
+        gmail: personalProviderRuntime?.mail,
+        "google-tasks": personalProviderRuntime?.tasks,
+        "google-calendar": personalProviderRuntime?.calendar,
+    },
+});
 let instanceControl: InstanceControl | null = null;
 let runtimeStarted = false;
 let nextRemoteCommandPromise: Promise<RemoteCommand> | null = null;
@@ -60,6 +83,7 @@ let lastAssistantSpeech = "";
 
 let nextCommandPromise:
     Promise<string> | null = null;
+let nextCommandFailed = false;
 let nextCommandRequestId: string | null = null;
 let currentRequestId: string | null = null;
 let nextNotificationPromise: Promise<NotificationRecord> | null = null;
@@ -82,7 +106,7 @@ function interruptForRemoteCommand(): void {
     currentTurnInterrupted = true;
     currentTurnController?.abort(new DOMException("Novo comando recebido pelo terminal", "AbortError"));
     ai.abortCurrentResponse();
-    void speechQueue.interrupt();
+    void speechQueue.interrupt().catch(() => debugLog("[VOICE] Limpeza de áudio interrompida."));
 }
 
 function ensureNotificationWait(): Promise<NotificationRecord> {
@@ -134,11 +158,32 @@ function ensureListening(): Promise<string> {
             "[BARGE] STT armado."
         );
 
-        nextCommandPromise =
-            stt.listen();
+        nextCommandFailed = false;
+        const listening = waitForServiceReady(supervisor, "stt", lifecycleController.signal)
+            .then(() => stt.listen(lifecycleController.signal));
+        nextCommandPromise = listening;
+        // Playback may arm STT before the loop is awaiting it. Observe failures
+        // now without replacing the promise or losing the next transcription.
+        void listening.catch(() => {
+            if (nextCommandPromise !== listening) return;
+            nextCommandFailed = true;
+            rearmRecoveredVoiceDuringPlayback();
+        });
     }
 
     return nextCommandPromise;
+}
+
+function rearmRecoveredVoiceDuringPlayback(): void {
+    if (lifecycleController.signal.aborted || !speechQueue.isSpeaking()
+        || supervisor.snapshot("stt").state !== "ready") return;
+    if (nextCommandFailed) {
+        finishRequestTimeline(nextCommandRequestId);
+        nextCommandPromise = null;
+        nextCommandRequestId = null;
+        nextCommandFailed = false;
+    }
+    void ensureListening();
 }
 
 const speechQueue =
@@ -164,6 +209,7 @@ const speechQueue =
                 debugLog(
                     "\n[BARGE] Ultron começou a falar; armando STT."
                 );
+                rearmRecoveredVoiceDuringPlayback();
                 void ensureListening();
             },
             onPlaybackEnd() {
@@ -226,7 +272,7 @@ stt.onSpeechStart(
             state: "listening",
             message: "Interrupção detectada",
         });
-        void speechQueue.interrupt();
+        void speechQueue.interrupt().catch(() => debugLog("[VOICE] Limpeza de áudio interrompida."));
     },
 );
 
@@ -349,6 +395,10 @@ async function speak(
 ): Promise<void> {
     currentTurnController?.signal.throwIfAborted();
     currentTurnInterrupted = false;
+    if (!tts.isReady()) {
+        if (activeNotificationTrust !== null) activeNotificationDeliveryFailed = true;
+        return; // The response is still available in the terminal and HUD.
+    }
     lastAssistantSpeech = text;
 
     speechQueue.reset();
@@ -371,6 +421,10 @@ function shutdownServices(): Promise<void> {
         currentTurnInterrupted = true;
         currentTurnController?.abort(new DOMException("Ultron encerrado", "AbortError"));
         ai.abortCurrentResponse();
+        terminalInput.stop();
+        // Disable recovery before stopping owned processes, so shutdown cannot
+        // race a worker restart. Existing cleanup remains idempotent.
+        const supervisedStop = supervisor.stopAll();
         const interrupted = speechQueue.interrupt().catch(error => {
             debugLog("[SHUTDOWN] Falha ao limpar fila de voz:", error);
         });
@@ -393,11 +447,9 @@ function shutdownServices(): Promise<void> {
             }
         }
 
-        try {
-            await stopAutomationRuntime();
-        } catch (error) {
-            debugLog("[SHUTDOWN] Falha ao persistir Automation Core:", error);
-        }
+        // The supervisor already drains Automation Core within its stop deadline.
+        // Do not add an unbounded second await after that deadline.
+        await supervisedStop;
         await interrupted;
         // Release the atomic singleton only after service teardown was requested.
         await instanceControl?.close();
@@ -419,53 +471,55 @@ async function main(): Promise<void> {
         console.log(`Interface: ${hud.url()}`);
         hud.openInBrowser();
 
-        debugLog(
-            "Carregando sistema de voz..."
-        );
-        debugLog(
-            "Carregando reconhecimento de voz..."
-        );
-
-        await Promise.all([
-            perf.measure(
-                "TTS startup",
-                async () => {
-                    await tts.start();
-                    debugLog("Serviço de voz carregado.");
-                },
-            ),
-            perf.measure(
-                "STT startup",
-                async () => {
-                    await stt.start();
-                    debugLog("Reconhecimento de voz carregado.");
-                },
-            ),
-        ]);
-        lifecycleController.signal.throwIfAborted();
-
         // Registra as tools determinísticas antes de aceitar o primeiro comando.
         // O carregamento dos jobs persistidos continua em background.
         registerToolActions();
-        fastRouter.start();
-        instanceControl?.update({ phase: "ready", detail: "Voz e tools prontas." });
-
-        console.log(
-            "\nUltron iniciado."
-        );
-
-        // Serviços de fundo só entram depois do caminho crítico de voz/tools.
-        startLightService();
-        startAutomaticDeviceDiscovery();
-        void startAutomationRuntime(lifecycleController.signal).catch(error => {
-            debugLog("[AUTOMATION] Serviço degradado:", error);
-            instanceControl?.update({ phase: "degraded", detail: "Voz disponível; serviço de automações em modo degradado." });
+        supervisor.onStateChange(snapshot => {
+            if (lifecycleController.signal.aborted) return;
+            const snapshots = supervisor.snapshots();
+            hud.update({ services: publicServiceHealth(snapshots) });
+            instanceControl?.update(runtimeHealthSummary(snapshots));
+            debugLog("[SERVICE]", { name: snapshot.name, state: snapshot.state, restarts: snapshot.restarts });
+            if (snapshot.state === "failed") {
+                console.warn(`[SERVICE] ${snapshot.name} indisponível. O terminal continua disponível.`);
+            }
+            if (snapshot.name === "tts" && (snapshot.state === "degraded" || snapshot.state === "failed")) {
+                void speechQueue.interrupt().catch(() => debugLog("[VOICE] Limpeza de áudio interrompida."));
+            }
+            if (snapshot.name === "stt" && snapshot.state === "ready") rearmRecoveredVoiceDuringPlayback();
         });
+        instanceControl?.update(runtimeHealthSummary(supervisor.snapshots()));
+        hud.update({ services: publicServiceHealth(supervisor.snapshots()) });
 
+        if (process.stdin.isTTY) {
+            terminalInput.start({
+                input: process.stdin,
+                accept: text => instanceControl!.acceptInitialCommand(text),
+                onError: message => console.warn(message),
+                onInterrupt: () => { void shutdownServices(); },
+            });
+        }
+        const startup = startCoreServices({
+            supervisor, backgroundServices, signal: lifecycleController.signal,
+            onBackgroundStart: () => {
+                fastRouter.start();
+                startAutomaticDeviceDiscovery();
+            },
+        });
+        void startup.voice.then(() => {
+            if (lifecycleController.signal.aborted) return;
+            console.log(stt.isReady() && tts.isReady()
+                ? "Voz pronta. Ultron está ouvindo."
+                : "Ultron disponível pelo terminal; consulte ultron status para verificar a voz.");
+        }).catch(() => debugLog("[SERVICE] Inicialização de voz interrompida."));
+        void startup.background.catch(() => {
+            if (!lifecycleController.signal.aborted) debugLog("[SERVICE] Inicialização de fundo degradada.");
+        });
+        console.log("Ultron disponível pelo CMD. Carregando voz em segundo plano.");
 
         hud.update({
             state: "listening",
-            message: "Aguardando comando de voz",
+            message: "Carregando voz; comandos pelo terminal disponíveis",
         });
 
         let assistantMode:
@@ -483,13 +537,17 @@ async function main(): Promise<void> {
 
             let inputEvent:
                 | { kind: "command"; command: string }
+                | { kind: "voice-error"; error: unknown }
                 | { kind: "remote-command"; remote: RemoteCommand }
                 | { kind: "notification"; notification: NotificationRecord }
                 | { kind: "notification-error"; error: unknown };
             try {
                 inputEvent = await Promise.race([
                     ensureRemoteCommandWait().then(remote => ({ kind: "remote-command" as const, remote })),
-                    commandPromise.then(command => ({ kind: "command" as const, command })),
+                    commandPromise.then(
+                        command => ({ kind: "command" as const, command }),
+                        error => ({ kind: "voice-error" as const, error }),
+                    ),
                     ensureNotificationWait().then(
                         notification => ({ kind: "notification" as const, notification }),
                         error => ({ kind: "notification-error" as const, error }),
@@ -499,7 +557,27 @@ async function main(): Promise<void> {
                 finishRequestTimeline(voiceRequestId);
                 nextCommandPromise = null;
                 nextCommandRequestId = null;
+                if (lifecycleController.signal.aborted) break;
                 throw error;
+            }
+
+            if (inputEvent.kind === "voice-error") {
+                finishRequestTimeline(voiceRequestId);
+                // Recovery may already have rearmed STT while the old turn was
+                // speaking. Do not lose that new microphone promise here.
+                if (nextCommandPromise === commandPromise) {
+                    nextCommandPromise = null;
+                    nextCommandRequestId = null;
+                    nextCommandFailed = false;
+                }
+                perf.end("STT listen");
+                if (lifecycleController.signal.aborted) break;
+                debugLog("[STT] Escuta interrompida; aguardando recuperação do serviço.");
+                hud.update({
+                    state: "listening",
+                    message: "Voz indisponível; comandos pelo terminal disponíveis",
+                });
+                continue;
             }
 
             if (inputEvent.kind === "notification-error") {
@@ -857,9 +935,7 @@ async function main(): Promise<void> {
                     );
 
 
-                    speechQueue.enqueue(
-                        response,
-                    );
+                    if (tts.isReady()) speechQueue.enqueue(response);
                     lastAssistantSpeech = response;
 
                     hud.update({ response });
@@ -958,9 +1034,7 @@ async function main(): Promise<void> {
                             break;
                         }
 
-                        speechQueue.enqueue(
-                            chunk
-                        );
+                        if (tts.isReady()) speechQueue.enqueue(chunk);
                     }
                 }
 
@@ -971,9 +1045,7 @@ async function main(): Promise<void> {
                         const chunk
                         of chunker.flush()
                     ) {
-                        speechQueue.enqueue(
-                            chunk
-                        );
+                        if (tts.isReady()) speechQueue.enqueue(chunk);
                     }
                 }
 
@@ -1018,7 +1090,13 @@ async function main(): Promise<void> {
                     continue;
                 }
 
-                throw error;
+                // A failed request must not bring down voice, IPC or subsequent
+                // commands. Never replay an action whose outcome is uncertain.
+                await speechQueue.interrupt().catch(() => undefined);
+                const response = "A solicitação falhou. Se uma ação já foi enviada, confira o resultado antes de repetir.";
+                console.warn(`Ultron> ${response}`);
+                debugLog("[REQUEST] Falha isolada.", { requestId, conversationId });
+                hud.update({ state: "error", message: "Solicitação não concluída", response });
             } finally {
                 finishRequestTimeline(requestId);
                 if (currentRequestId === requestId) currentRequestId = null;

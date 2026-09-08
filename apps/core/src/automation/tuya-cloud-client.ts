@@ -6,6 +6,7 @@ import path from "node:path";
 import { servicePath } from "../config/runtime.ts";
 import { debugLog } from "../utils/debug.ts";
 import { perf } from "../utils/performance.ts";
+import { awaitServiceOperation, timedServiceOperation } from "../system/service-lifecycle.ts";
 
 type PendingRequest = {
     id: string;
@@ -37,13 +38,29 @@ export class TuyaCloudClient {
     private child: ChildProcessWithoutNullStreams | null = null;
     private readonly pending = new Map<string, PendingRequest>();
     private activeId: string | null = null;
+    private ready = false;
+    private readiness: { promise: Promise<void>; resolve(): void; reject(error: Error): void } | null = null;
+    private readonly failureListeners = new Set<(error: Error) => void>();
 
     constructor(private readonly options: TuyaClientOptions = {}) {}
 
     start(): void {
         if (this.child) return;
-        const child = this.options.spawnProcess?.(this.options.mode ?? "light")
-            ?? this.spawnService();
+        this.ready = false;
+        let resolveReady!: () => void;
+        let rejectReady!: (error: Error) => void;
+        const promise = new Promise<void>((resolve, reject) => { resolveReady = resolve; rejectReady = reject; });
+        void promise.catch(() => undefined);
+        this.readiness = { promise, resolve: resolveReady, reject: rejectReady };
+        let child: ChildProcessWithoutNullStreams;
+        try {
+            child = this.options.spawnProcess?.(this.options.mode ?? "light") ?? this.spawnService();
+        } catch {
+            const error = new Error("Não foi possível iniciar o serviço Tuya.");
+            this.readiness.reject(error);
+            this.readiness = null;
+            throw error;
+        }
         this.child = child;
         const lines = createInterface({ input: child.stdout });
         lines.on("line", line => {
@@ -55,13 +72,43 @@ export class TuyaCloudClient {
             if (this.child !== child) return;
             this.retire(child);
             this.failAll(error);
+            for (const listener of this.failureListeners) {
+                try { listener(error); } catch { /* Observer isolation. */ }
+            }
         };
         child.stdin.on("error", () => failed(new Error("Canal do serviço Tuya indisponível.")));
+        child.stdout.on("error", () => failed(new Error("Saída do serviço Tuya indisponível.")));
+        child.stderr.on("error", () => failed(new Error("Diagnóstico do serviço Tuya indisponível.")));
         child.once("error", () => failed(new Error("Não foi possível iniciar o serviço Tuya.")));
         child.once("close", code => {
             lines.close();
             failed(new Error(`Serviço Tuya persistente encerrou com código ${code}.`));
         });
+    }
+
+    isReady(): boolean {
+        return Boolean(this.child && !this.child.killed && this.ready);
+    }
+
+    onFailure(listener: (error: Error) => void): () => void {
+        this.failureListeners.add(listener);
+        return () => this.failureListeners.delete(listener);
+    }
+
+    async waitUntilReady(signal?: AbortSignal): Promise<void> {
+        signal?.throwIfAborted();
+        this.start();
+        const pending = this.readiness!.promise;
+        await timedServiceOperation(signal => awaitServiceOperation(pending, signal), {
+            signal, timeoutMs: 10_000, label: "Tuya startup",
+        });
+    }
+
+    async healthCheck(signal?: AbortSignal): Promise<boolean> {
+        signal?.throwIfAborted();
+        // Readiness of the owned worker only. Never query or toggle a device
+        // for health checks; an in-flight I/O stall is bounded by request().
+        return this.isReady();
     }
 
     private spawnService(): ChildProcessWithoutNullStreams {
@@ -141,8 +188,13 @@ export class TuyaCloudClient {
     }
 
     private retire(child: ChildProcessWithoutNullStreams): void {
-        if (this.child === child) this.child = null;
-        child.kill();
+        if (this.child === child) {
+            this.child = null;
+            this.ready = false;
+            this.readiness?.reject(new Error("Serviço Tuya encerrado antes de confirmar prontidão."));
+            this.readiness = null;
+        }
+        try { child.kill(); } catch { /* Already exited. */ }
     }
 
     private cancelRequest(id: string, error: Error): void {
@@ -177,7 +229,13 @@ export class TuyaCloudClient {
             return;
         }
 
-        if (!result || typeof result !== "object" || typeof result.id !== "string" || result.id !== this.activeId) return;
+        if (!result || typeof result !== "object") return;
+        if (result.type === "ready" && result.mode === (this.options.mode ?? "light")) {
+            this.ready = true;
+            this.readiness?.resolve();
+            return;
+        }
+        if (typeof result.id !== "string" || result.id !== this.activeId) return;
         const request = this.take(result.id);
         if (!request) return;
         this.activeId = null;

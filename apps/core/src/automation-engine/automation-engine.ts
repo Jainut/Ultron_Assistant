@@ -52,6 +52,12 @@ export class AutomationEngine {
     readonly retryPolicy: RetryPolicy;
 
     private started = false;
+    private startInFlight?: Promise<void>;
+    private stopInFlight?: Promise<void>;
+    private lifetime?: AbortController;
+    private lifetimeSignal?: AbortSignal;
+    private startupEvent?: TriggerEvent;
+    private startupDispatched = false;
 
     constructor(options: AutomationEngineOptions) {
         this.automations = new AutomationStore(
@@ -70,6 +76,8 @@ export class AutomationEngine {
                 pollIntervalMs: options.pollIntervalMs,
                 maxConcurrency: options.maxConcurrency,
                 onError: options.onError,
+                canRetryJob: options.canRetryJob,
+                awaitInitialTick: options.awaitInitialTick,
             },
         );
     }
@@ -144,31 +152,59 @@ export class AutomationEngine {
     }
 
     async start(signal?: AbortSignal): Promise<void> {
-        if (this.started) {
-            return;
-        }
+        if (this.stopInFlight) await this.stopInFlight;
         signal?.throwIfAborted();
+        if (this.startInFlight) return this.startInFlight;
+        if (this.started && !this.lifetimeSignal?.aborted) return;
+        const operation = this.startEngine(signal);
+        this.startInFlight = operation;
+        try {
+            await operation;
+        } finally {
+            if (this.startInFlight === operation) this.startInFlight = undefined;
+        }
+    }
+
+    private async startEngine(signal?: AbortSignal): Promise<void> {
         this.started = true;
+        const lifetime = new AbortController();
+        this.lifetime = lifetime;
+        const startSignal = signal ? AbortSignal.any([signal, lifetime.signal]) : lifetime.signal;
+        this.lifetimeSignal = startSignal;
 
         try {
             const now = new Date();
-            await this.scheduler.recoverInterruptedJobs(now);
-            const startupEvent = this.triggers.createEvent(
-                "system.startup",
-                {},
-                now,
-            );
-            await this.dispatch(startupEvent, true);
-            await this.scheduler.start(signal);
+            await this.scheduler.recoverInterruptedJobs(now, startSignal);
+            startSignal.throwIfAborted();
+            if (!this.startupDispatched) {
+                // The supervisor may restart this same engine. It is not a new process startup.
+                this.startupEvent ??= this.triggers.createEvent("system.startup", {}, now);
+                await this.dispatch(this.startupEvent, true);
+                this.startupDispatched = true;
+            }
+            startSignal.throwIfAborted();
+            await this.scheduler.start(startSignal);
+            startSignal.throwIfAborted();
         } catch (error) {
             this.started = false;
+            await this.scheduler.stop();
             throw error;
         }
     }
 
     async stop(): Promise<void> {
+        if (this.stopInFlight) return this.stopInFlight;
         this.started = false;
-        await this.scheduler.stop();
+        this.lifetime?.abort(new DOMException("Automation engine stopped", "AbortError"));
+        const stopping = [this.scheduler.stop()];
+        if (this.startInFlight) stopping.push(this.startInFlight);
+        const operation = Promise.allSettled(stopping).then(() => undefined);
+        this.stopInFlight = operation;
+        try {
+            await operation;
+        } finally {
+            if (this.stopInFlight === operation) this.stopInFlight = undefined;
+        }
     }
 
     async dispatch(
@@ -190,7 +226,8 @@ export class AutomationEngine {
                 skipOutstanding
                 && existingJobs.some((job) => (
                     job.automationId === automation.id
-                    && (job.status === "scheduled"
+                    && (job.triggerEvent?.id === event.id
+                        || job.status === "scheduled"
                         || job.status === "retrying"
                         || job.status === "running")
                 ))

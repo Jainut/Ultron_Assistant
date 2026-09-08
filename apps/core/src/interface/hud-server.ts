@@ -3,6 +3,7 @@ import { createServer, type Server, type ServerResponse } from "node:http";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { runtimeConfig } from "../config/runtime.ts";
+import type { PublicServiceHealth } from "../system/runtime-health.ts";
 
 export type HudState =
     | "booting"
@@ -18,6 +19,7 @@ export interface HudSnapshot {
     transcript?: string;
     response?: string;
     timings?: Record<string, number>;
+    services?: PublicServiceHealth[];
 }
 
 const mimeTypes: Record<string, string> = {
@@ -25,6 +27,30 @@ const mimeTypes: Record<string, string> = {
     ".html": "text/html; charset=utf-8",
     ".js": "text/javascript; charset=utf-8",
 };
+
+const serviceNames = new Set([
+    "stt", "tts", "tuya", "tuya-home", "automation", "ollama", "gmail", "google-tasks", "google-calendar",
+]);
+const serviceStates = new Set(["starting", "ready", "degraded", "restarting", "failed", "stopped"]);
+
+function safeServiceHealth(value: unknown): PublicServiceHealth[] {
+    if (!Array.isArray(value)) return [];
+    const services: PublicServiceHealth[] = [];
+    const seen = new Set<string>();
+    for (const entry of value.slice(0, 64)) {
+        if (!entry || typeof entry !== "object" || Array.isArray(entry)
+            || typeof entry.name !== "string" || !serviceNames.has(entry.name) || seen.has(entry.name)
+            || typeof entry.state !== "string" || !serviceStates.has(entry.state)
+            || !Number.isSafeInteger(entry.attempts) || entry.attempts < 0
+            || !Number.isSafeInteger(entry.restarts) || entry.restarts < 0) continue;
+        seen.add(entry.name);
+        // Structural typing also accepts ServiceSnapshot[] here. Never forward
+        // its lastFailure, paths or provider payloads to the browser by accident.
+        services.push({ name: entry.name, state: entry.state as PublicServiceHealth["state"],
+            attempts: entry.attempts, restarts: entry.restarts });
+    }
+    return services;
+}
 
 export class HudServer {
     private server: Server | null = null;
@@ -65,20 +91,44 @@ export class HudServer {
 
         return new Promise((resolve, reject) => {
             const server = createServer((request, response) => {
-                const requestUrl = new URL(request.url ?? "/", this.url());
+                response.setHeader("X-Content-Type-Options", "nosniff");
+                const deny = (status: number, message: string): void => {
+                    response.writeHead(status, { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" });
+                    response.end(message);
+                };
+                const host = request.headers.host?.toLowerCase();
+                const allowedHosts = new Set([`127.0.0.1:${this.port}`, `localhost:${this.port}`]);
+                if (this.port === 80) { allowedHosts.add("127.0.0.1"); allowedHosts.add("localhost"); }
+                // Loopback binding alone does not stop DNS rebinding: browsers
+                // must not access private snapshots under an external Host.
+                if (!host || !allowedHosts.has(host)) {
+                    deny(403, "Host not allowed");
+                    return;
+                }
+                const requestOrigin = new URL(`http://${host}`).origin;
 
                 // Transcripts are local/private: a third-party page cannot read
                 // this loopback API through a permissive CORS response.
-                if (request.headers.origin && request.headers.origin !== this.url()) {
-                    response.writeHead(403);
-                    response.end("Origin not allowed");
+                if (request.headers.origin !== undefined && request.headers.origin !== requestOrigin) {
+                    deny(403, "Origin not allowed");
+                    return;
+                }
+                let requestUrl: URL;
+                try {
+                    requestUrl = new URL(request.url ?? "/", requestOrigin);
+                } catch {
+                    deny(400, "Invalid URL");
+                    return;
+                }
+                if (requestUrl.origin !== requestOrigin || requestUrl.username || requestUrl.password) {
+                    deny(403, "URL origin not allowed");
                     return;
                 }
 
                 if (requestUrl.pathname === "/api/events") {
                     response.writeHead(200, {
                         "Content-Type": "text/event-stream",
-                        "Cache-Control": "no-cache",
+                        "Cache-Control": "no-store",
                         Connection: "keep-alive",
                         "X-Content-Type-Options": "nosniff",
                     });
@@ -92,7 +142,7 @@ export class HudServer {
                 }
 
                 if (requestUrl.pathname === "/api/status") {
-                    response.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+                    response.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
                     response.end(JSON.stringify(this.snapshot));
                     return;
                 }
@@ -141,6 +191,7 @@ export class HudServer {
 
     update(update: Partial<HudSnapshot>): void {
         this.snapshot = { ...this.snapshot, ...update };
+        if (Object.hasOwn(update, "services")) this.snapshot.services = safeServiceHealth(update.services);
         this.snapshotVersion += 1;
         if (this.broadcastTimer || this.clients.size === 0) return;
 

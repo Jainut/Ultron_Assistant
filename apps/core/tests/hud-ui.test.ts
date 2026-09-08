@@ -20,11 +20,13 @@ class ElementStub {
     width = 0;
     height = 0;
     dateTime = "";
+    dataset: Record<string, string> = {};
     attributes = new Map<string, string>();
     listeners = new Map<string, Listener>();
     getContext: (...args: unknown[]) => unknown = () => null;
     getBoundingClientRect() { return { width: 600, height: 600 }; }
     setAttribute(name: string, value: string) { this.attributes.set(name, value); }
+    getAttribute(name: string) { return this.attributes.get(name) ?? null; }
     addEventListener(name: string, listener: Listener) { this.listeners.set(name, listener); }
 }
 
@@ -298,4 +300,100 @@ test("HUD respects reduced motion with one static frame and still receives conve
     assert.equal(hud.frames.size, 0);
     assert.equal(hud.timers.size, 0);
     assert.equal(hud.evaluate("animationTime"), 8);
+});
+
+test("HUD legacy/missing health remains unknown instead of inventing ready services", () => {
+    const hud = createHarness();
+    hud.streams[0].onopen?.();
+    hud.snapshot({ state: "listening", message: "Pronto para ouvir" });
+    hud.frame();
+    for (const name of ["stt", "tts", "ollama", "tuya", "tuya-home", "automation", "gmail", "google-tasks", "google-calendar"]) {
+        assert.equal(hud.element(`#health-${name}`).textContent, "Sem dados");
+        assert.equal(hud.element(`#service-${name}`).dataset.health, "unknown");
+    }
+    assert.match(hud.element("#service-summary").textContent, /ainda não informada/);
+});
+
+test("HUD displays every real service state and only public counters", () => {
+    const hud = createHarness();
+    hud.streams[0].onopen?.();
+    const states = [
+        ["stt", "starting", "Iniciando"], ["tts", "ready", "Pronto"], ["ollama", "degraded", "Limitado"],
+        ["tuya", "restarting", "Reiniciando"], ["automation", "failed", "Indisponível"], ["gmail", "stopped", "Parado"],
+    ];
+    hud.snapshot({ state: "speaking", transcript: "oi", response: "Olá", services: states.map(([name, state]) => ({
+        name, state, attempts: 2, restarts: 1, lastFailure: "private-error-payload",
+    })) });
+    hud.frame();
+    for (const [name, state, label] of states) {
+        assert.equal(hud.element(`#health-${name}`).textContent, label);
+        assert.equal(hud.element(`#service-${name}`).dataset.health, state);
+        assert.match(hud.element(`#service-${name}`).getAttribute("title") ?? "", /Tentativas: 2; reinícios: 1/);
+    }
+    assert.equal(hud.element("#response").textContent, "Olá");
+    assert.equal(hud.document.body.dataset.state, "speaking");
+    assert.match(hud.element("#service-summary").textContent, /1\/6 prontos/);
+    assert.match(hud.element("#service-summary").textContent, /2 em atenção/);
+    assert.doesNotMatch(hud.evaluate<string>("JSON.stringify([...currentServices])"), /private-error|lastFailure/);
+    hud.snapshot({ timings: { tool_duration: 40 } });
+    hud.frame();
+    assert.equal(hud.element("#health-tts").textContent, "Pronto", "partial snapshots preserve reported health");
+});
+
+test("HUD malformed health clears stale values without rendering arbitrary states or names", () => {
+    const hud = createHarness();
+    hud.streams[0].onopen?.();
+    hud.snapshot({ services: [{ name: "stt", state: "ready", attempts: 1, restarts: 0 }] });
+    hud.frame();
+    hud.snapshot({ services: [
+        { name: "stt", state: { toString: null, valueOf: null }, attempts: 1, restarts: 0 },
+        { name: "tts", state: "__proto__", attempts: 1, restarts: 0 },
+        { name: "gmail", state: "ready", attempts: -1, restarts: 0 },
+        { name: "<img src=x>", state: "ready", attempts: 1, restarts: 0 },
+        { name: "ollama", state: "ready", attempts: 1 },
+    ] });
+    assert.doesNotThrow(() => hud.frame());
+    assert.equal(hud.evaluate("currentServices.size"), 0);
+    assert.equal(hud.element("#health-stt").textContent, "Sem dados");
+    for (const invalid of [null, {}, "ready", []]) {
+        hud.snapshot({ services: invalid });
+        assert.doesNotThrow(() => hud.frame());
+        assert.equal(hud.evaluate("currentServices.size"), 0);
+    }
+});
+
+test("HUD coalesces service health while hidden together with conversation", () => {
+    const hud = createHarness();
+    hud.streams[0].onopen?.();
+    hud.visibility(true);
+    hud.snapshot({ services: [{ name: "tts", state: "ready", attempts: 1, restarts: 0 }], response: "A" });
+    hud.snapshot({ services: [{ name: "tts", state: "restarting", attempts: 2, restarts: 1 }], response: "AB" });
+    assert.equal(hud.frames.size, 0);
+    assert.equal(hud.element("#health-tts").textContent, "Sem dados");
+    hud.visibility(false);
+    assert.equal(hud.frames.size, 1);
+    hud.frame();
+    assert.equal(hud.element("#health-tts").textContent, "Reiniciando");
+    assert.equal(hud.element("#response").textContent, "AB");
+});
+
+test("HUD reconnect cannot revive ready health from a closed stream or older backend", () => {
+    const hud = createHarness();
+    const first = hud.streams[0];
+    first.onopen?.();
+    const ready = { services: [{ name: "stt", state: "ready", attempts: 1, restarts: 0 }] };
+    hud.snapshot(ready);
+    hud.frame();
+    assert.equal(hud.element("#health-stt").textContent, "Pronto");
+    hud.snapshot(ready); // This pending frame belongs to the stream about to close.
+    first.onerror?.();
+    assert.equal(hud.element("#health-stt").textContent, "Sem conexão");
+    hud.frame();
+    hud.timeout();
+    hud.streams[1].onopen?.();
+    hud.snapshot({ state: "listening" }); // Older backend without services.
+    hud.frame();
+    assert.equal(hud.element("#health-stt").textContent, "Sem dados");
+    assert.equal(hud.element("#service-stt").dataset.health, "unknown");
+    assert.equal(hud.evaluate("currentServices.size"), 0);
 });
