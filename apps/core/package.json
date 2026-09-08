@@ -30,7 +30,8 @@
   },
   "dependencies": {
     "@kud/androidtv-remote": "^0.1.2",
-    "ollama": "^0.6.3"
+    "ollama": "^0.6.3",
+    "yaml": "2.9.0"
   },
   "overrides": {
     "protobufjs": "7.6.5"

@@ -177,8 +177,25 @@ Com `ULTRON_DEBUG=1`, o terminal mostra intent, seleção e execução de tools,
 resolução de aplicativos, primeiro token, primeiro chunk de TTS, playback e
 tempo total. O modo normal continua conciso.
 
-O estudo para uma memória de longo prazo baseada em notas interligadas está em
-[`docs/OBSIDIAN_BRAIN.md`](docs/OBSIDIAN_BRAIN.md).
+## Notas do Obsidian (opcional, somente leitura)
+
+Defina `ULTRON_OBSIDIAN_VAULT` com o caminho absoluto do seu vault em
+`ultron.env.cmd` e reinicie a instância. Não é preciso abrir o Obsidian.
+
+```text
+procure nas minhas notas sobre TypeScript
+leia a nota Projetos/Ultron.md
+resuma essa nota
+mostra as conexões dessa nota
+status do obsidian
+```
+
+Busca lexical, títulos, aliases, tags, properties, links e backlinks usam um
+índice incremental em background. Somente o resumo passa pela LLM; os demais
+comandos não dependem dela. A integração não escreve nas notas nem executa
+instruções encontradas nelas. O cache local contém conteúdo das notas e deve
+ser tratado como privado. Veja [configuração e limites](docs/OBSIDIAN_BRAIN.md)
+e [validação da etapa P6A](docs/P6_OBSIDIAN_READ_ONLY.md).
 
 ## Automação residencial
 

@@ -26,6 +26,7 @@ import { createCoreSupervision, startCoreServices } from "./system/core-supervis
 import { checkLocalOllamaHealth, publicServiceHealth, runtimeHealthSummary, waitForServiceReady } from "./system/runtime-health.ts";
 import { TerminalInput } from "./system/terminal-input.ts";
 import { runtimeConfig } from "./config/runtime.ts";
+import { obsidianIndex } from "./memory/runtime.ts";
 import {
     automationEngine,
     registerToolActions,
@@ -90,6 +91,7 @@ let nextNotificationPromise: Promise<NotificationRecord> | null = null;
 let notificationDeliveryDisabled = false;
 const attemptedNotificationIds = new Set<string>();
 let activeNotificationTrust: NotificationTrust | null = null;
+let currentResponseFromMemory = false;
 let interruptedUntrustedNotification = false;
 let activeNotificationDeliveryFailed = false;
 
@@ -258,7 +260,7 @@ stt.onSpeechStart(
             "[VOICE] Interrupção detectada."
         );
 
-        if (activeNotificationTrust === "untrusted-derived") {
+        if (activeNotificationTrust === "untrusted-derived" || currentResponseFromMemory) {
             // A primeira transcrição pode ser eco do próprio aviso externo.
             // Ela só interrompe a fala; nunca pode virar uma ação/tool.
             interruptedUntrustedNotification = true;
@@ -438,6 +440,7 @@ function shutdownServices(): Promise<void> {
             () => androidTvRemote.stop(),
             () => applicationResolver.stop(),
             () => fileSystem.stop(),
+            () => obsidianIndex.stop(),
         ];
         for (const stop of stops) {
             try {
@@ -504,6 +507,7 @@ async function main(): Promise<void> {
             onBackgroundStart: () => {
                 fastRouter.start();
                 startAutomaticDeviceDiscovery();
+                obsidianIndex.start();
             },
         });
         void startup.voice.then(() => {
@@ -687,7 +691,7 @@ async function main(): Promise<void> {
                 debugLog("[BARGE] Transcrição durante aviso externo descartada por segurança.");
                 hud.update({
                     state: "listening",
-                    message: "Aviso interrompido; repita o comando",
+                    message: "Leitura interrompida; repita o comando",
                 });
                 finishRequestTimeline(requestId);
                 if (currentRequestId === requestId) currentRequestId = null;
@@ -716,6 +720,7 @@ async function main(): Promise<void> {
 
             perf.startRequest();
             currentTurnController = new AbortController();
+            currentResponseFromMemory = false;
             const turnSignal = currentTurnController.signal;
 
 
@@ -874,6 +879,7 @@ async function main(): Promise<void> {
                 turnSignal.throwIfAborted();
 
                 if (fastResult) {
+                    currentResponseFromMemory = fastResult.actions.some(action => action.name.startsWith("memory."));
                     const response = fastResult.needsInterpretation
                         ? await ai.interpretToolResults(
                             command,
@@ -887,7 +893,7 @@ async function main(): Promise<void> {
                         : fastResult.response;
                     turnSignal.throwIfAborted();
                     console.log(`Ultron> ${response}`);
-                    if (!fastResult.needsInterpretation) {
+                    if (!fastResult.needsInterpretation && !currentResponseFromMemory) {
                         ai.rememberExchange(command, response);
                     }
                     await speak(response);
@@ -935,6 +941,7 @@ async function main(): Promise<void> {
                     );
 
 
+                    currentResponseFromMemory = ai.lastResponseFromMemory;
                     if (tts.isReady()) speechQueue.enqueue(response);
                     lastAssistantSpeech = response;
 

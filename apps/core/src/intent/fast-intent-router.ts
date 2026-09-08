@@ -9,6 +9,7 @@ import { debugLog } from "../utils/debug.ts";
 import { perf } from "../utils/performance.ts";
 import { requestPerformanceTimelines } from "../utils/request-performance-timeline.ts";
 import { parsePersonalIntent } from "./personal-intent-parser.ts";
+import { parseMemoryIntent } from "./memory-intent-parser.ts";
 import { redactForLog } from "../utils/redaction.ts";
 import { formatToolExecutionResponses } from "../tools/tool-response-formatting.ts";
 
@@ -20,6 +21,7 @@ type FastAction = {
         | "filesystem"
         | "smart-home"
         | "information"
+        | "memory"
         | "mail"
         | "tasks"
         | "calendar"
@@ -232,6 +234,10 @@ export class FastIntentRouter {
     }
 
     private plan(input: string): FastAction[] {
+        // A title may itself contain "e abre ...". Parse the complete explicit
+        // note query before generic multi-command splitting to keep it data.
+        const memory = parseMemoryIntent(input);
+        if (memory) return [memory];
         const parts = splitCommands(input);
         const actions: FastAction[] = [];
         let plannedDevice = this.lastDevice;

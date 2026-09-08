@@ -43,6 +43,10 @@ set "ULTRON_TUYA_CONFIRM_COMMANDS=0"
 rem Roots adicionais para busca de arquivos, separados por ponto e vírgula.
 set "ULTRON_SEARCH_ROOTS="
 
+rem Opcional: caminho absoluto do vault Obsidian. Vazio desativa a integração.
+rem Somente leitura; o cache derivado fica em data/indexes/, fora do vault.
+set "ULTRON_OBSIDIAN_VAULT="
+
 rem Integrações Google (OAuth Desktop). Não commite credenciais reais.
 set "ULTRON_GOOGLE_CLIENT_ID="
 set "ULTRON_GOOGLE_CLIENT_SECRET="

@@ -1,4 +1,5 @@
 import ollama, {
+    Ollama,
     type Message,
     type Tool,
 } from "ollama";
@@ -18,6 +19,7 @@ import { ultronToolRegistry } from "../tools/core-tool-registry.ts";
 import type { ToolResult } from "../../shared/types.ts";
 import { redactForLog } from "../utils/redaction.ts";
 import { formatToolExecutionResponses } from "../tools/tool-response-formatting.ts";
+import { timedServiceOperation } from "../system/service-lifecycle.ts";
 
 
 const MODEL = runtimeConfig.ollamaModel;
@@ -62,7 +64,7 @@ Não execute ações destrutivas ou sensíveis sem a confirmação exigida pela 
 function modelTools(input: string): Tool[] {
     const text = normalizeCommand(input);
     const categories = new Set<
-        "system" | "filesystem" | "smart-home" | "information" | "mail" | "tasks" | "calendar" | "automation"
+        "system" | "filesystem" | "smart-home" | "information" | "memory" | "mail" | "tasks" | "calendar" | "automation"
     >();
 
     if (/\b(luz|lampada|tv|televisao|tomada|ventilador|dispositivo|casa)\b/.test(text)) {
@@ -75,6 +77,7 @@ function modelTools(input: string): Tool[] {
         categories.add("system");
     }
     if (/\b(hora|horario)\b/.test(text)) categories.add("information");
+    if (/\b(obsidian|notas|nota|anotacao|anotacoes|backlinks|vault)\b/.test(text)) categories.add("memory");
     if (/\b(email|emails|gmail|mensagem|remetente|assunto)\b/.test(text)) categories.add("mail");
     if (/\b(tarefa|tarefas|pendencia|pendencias)\b/.test(text)) categories.add("tasks");
     if (/\b(agenda|calendario|evento|reuniao|compromisso)\b/.test(text)) categories.add("calendar");
@@ -541,6 +544,8 @@ export function classifyAutomationIntent(
 
 export class OllamaService {
     private history: Message[] = [];
+    /** Lets the existing voice loop protect playback derived from vault data. */
+    lastResponseFromMemory = false;
 
     private readonly MAX_HISTORY_MESSAGES = 32;
 
@@ -593,6 +598,7 @@ export class OllamaService {
     ): Promise<string> {
         signal?.throwIfAborted();
         debugLog("[AI]", { model: MODEL, mode: "tools" });
+        this.lastResponseFromMemory = false;
         const directAutomation =
             parseDirectAutomationCommand(input);
 
@@ -888,6 +894,7 @@ Faça agora obrigatoriamente uma chamada à ferramenta control_light com os argu
         });
 
         await Promise.all(executions);
+        this.lastResponseFromMemory = toolCalls.some(call => call.function.name.startsWith("memory."));
 
         for (const [index, call] of toolCalls.entries()) {
             messages.push({
@@ -913,7 +920,7 @@ Faça agora obrigatoriamente uma chamada à ferramenta control_light com os argu
                 })),
             );
 
-            this.rememberTurn(input, finalResponse);
+            if (!this.lastResponseFromMemory) this.rememberTurn(input, finalResponse);
             return finalResponse;
         }
 
@@ -939,12 +946,7 @@ Faça agora obrigatoriamente uma chamada à ferramenta control_light com os argu
             );
 
 
-        this.rememberTurn(
-            input,
-            finalResponse,
-        );
-
-
+        if (!this.lastResponseFromMemory) this.rememberTurn(input, finalResponse);
         return finalResponse;
     }
 
@@ -959,6 +961,7 @@ Faça agora obrigatoriamente uma chamada à ferramenta control_light com os argu
         signal?: AbortSignal,
     ): Promise<string> {
         signal?.throwIfAborted();
+        this.lastResponseFromMemory = executions.some(execution => execution.name.startsWith("memory."));
         const serialized = JSON.stringify(executions);
         const boundedResults = serialized.length > 24_000
             ? `${serialized.slice(0, 24_000)}\n[resultado truncado por segurança]`
@@ -984,18 +987,23 @@ ${boundedResults}
 
         const response = await perf.measure(
             "AI tool interpretation",
-            () => ollama.chat({
+            () => timedServiceOperation(linkedSignal => new Ollama({
+                // Per-request transport: do not abort other users of the SDK singleton.
+                fetch: (input, init) => fetch(input, { ...init, signal: linkedSignal }),
+            }).chat({
                 model: MODEL,
                 messages,
                 stream: false,
                 think: false,
                 keep_alive: -1,
                 options: { temperature: 0.2 },
-            }),
+            }), { signal, timeoutMs: 45_000, label: "Resumo das tools" }),
         );
         signal?.throwIfAborted();
         const finalResponse = cleanResponse(response.message.content);
-        this.rememberTurn(input, finalResponse);
+        // Keep only the structured note reference in the memory tools. Do not
+        // promote note instructions into assistant history for future tool plans.
+        if (!this.lastResponseFromMemory) this.rememberTurn(input, finalResponse);
         return finalResponse;
     }
 
@@ -1101,6 +1109,8 @@ function shouldUseToolPath(
     if (parseDirectAutomationCommand(input)) {
         return true;
     }
+
+    if (/\b(obsidian|notas|nota|anotacao|anotacoes|backlinks|vault)\b/.test(text)) return true;
 
     /*
      * Lâmpada

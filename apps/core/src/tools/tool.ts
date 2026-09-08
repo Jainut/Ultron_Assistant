@@ -5,6 +5,7 @@ export type ToolCategory =
     | "filesystem"
     | "smart-home"
     | "information"
+    | "memory"
     | "mail"
     | "tasks"
     | "calendar"

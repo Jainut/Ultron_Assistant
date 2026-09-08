@@ -19,6 +19,8 @@ import type { PersonalProviderRuntime } from "../providers/personal-provider-run
 import { notificationCenter } from "../notifications/runtime.ts";
 import { createNotificationTools } from "./notifications/index.ts";
 import { createDailyBriefingTool } from "../personal-automation/index.ts";
+import { obsidianIndex } from "../memory/runtime.ts";
+import { createObsidianTools } from "./memory/obsidian.tools.ts";
 
 export let personalProviderRuntime: PersonalProviderRuntime | undefined;
 
@@ -432,6 +434,7 @@ export function createCoreToolRegistry(): ToolRegistry {
         },
     }));
 
+    for (const tool of createObsidianTools(obsidianIndex)) registry.register(tool);
     return registry;
 }
 
