@@ -451,7 +451,7 @@ function mailSearchInput(
     source: string,
     text: string,
 ): { readonly input: Record<string, unknown>; readonly confidence: number } | null {
-    if (!/\b(?:procura|procure|procurar|busca|busque|buscar|pesquisa|pesquise|encontra|encontre)\b/.test(text)
+    if (!/\b(?:procura|procure|procurar|busca|busque|buscar|pesquisa|pesquise|encontra|encontre|veja|ver|leia|ler|abre|abra|abrir|mostra|mostre)\b/.test(text)
         || !/\b(?:email|emails|e-mail|e-mails)\b/.test(text)) {
         return null;
     }
@@ -478,7 +478,7 @@ function mailSearchInput(
     if (loose) {
         const value = cleanQuery(loose);
         if (!value) return null;
-        const looksTopical = /^(?:assunto|processo|projeto|vaga|entrevista|pedido|fatura|workflow)\b/i.test(value);
+        const looksTopical = /^(?:assunto|processo|projeto|vaga|entrevista|pedido|fatura|workflow|contrato|prazo)\b/i.test(value);
         return {
             input: looksTopical ? { query: value } : { from: value },
             confidence: looksTopical ? 0.88 : 0.91,

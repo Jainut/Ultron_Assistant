@@ -12,6 +12,7 @@ import { parsePersonalIntent } from "./personal-intent-parser.ts";
 import { parseMemoryIntent } from "./memory-intent-parser.ts";
 import { redactForLog } from "../utils/redaction.ts";
 import { formatToolExecutionResponses } from "../tools/tool-response-formatting.ts";
+import { executeToolPlan, planSerialDependencies } from "../planning/tool-plan-executor.ts";
 
 type FastAction = {
     name: string;
@@ -51,7 +52,7 @@ function normalize(value: string): string {
 
 function splitCommands(input: string): string[] {
     return input
-        .split(/\s+(?:e|depois)\s+(?=(?:abre|abra|abrir|inicia|inicie|liga|ligue|acende|acenda|apaga|apague|desliga|desligue|deixa|coloca|ajusta|muda|entra|vai|volta|lista|liste|cria|crie|procura|procure|encontra|encontre|leia|ler|resuma|resume|marca|marque|conclui|conclua|conecta|conecte)\b)/i)
+        .split(/\s+(?:e|depois)\s+(?=(?:me\s+)?(?:abre|abra|abrir|inicia|inicie|liga|ligue|acende|acenda|apaga|apague|desliga|desligue|deixa|coloca|ajusta|muda|entra|vai|volta|lista|liste|cria|crie|procura|procure|encontra|encontre|leia|ler|resuma|resume|marca|marque|conclui|conclua|conecta|conecte|diz|diga|fale|conte|explica|explique|responde|responda|toca|toque)\b)/i)
         .map(part => part.trim())
         .filter(Boolean);
 }
@@ -155,48 +156,47 @@ export class FastIntentRouter {
             conversationId: context.conversationId,
         })));
         perf.record("Tool selection", performance.now() - intentStartedAt);
-        const chains = new Map<string, Promise<void>>();
-        const results: ToolResult[] = Array.from({ length: actions.length });
-        const executions = actions.map((action, index) => {
-            const execute = async (): Promise<void> => {
-                context.signal?.throwIfAborted();
-                debugLog(`[TOOL] ${action.name}`, {
-                    input: redactForLog(action.input),
-                    requestId: context.requestId,
-                    conversationId: context.conversationId,
-                    toolCallId: context.toolCallId
-                        ?? (context.requestId ? `${context.requestId}:${index + 1}` : undefined),
-                });
-                try {
-                    results[index] = await perf.measure(
-                        `Tool ${action.name}`,
-                        () => this.registry.execute(action.name, action.input, {
-                            ...context,
-                            toolCallId: context.toolCallId
-                                ?? (context.requestId ? `${context.requestId}:${index + 1}` : undefined),
-                        }),
-                    );
-                } catch (error) {
-                    if (context.signal?.aborted) throw error;
-                    debugLog(`[TOOL] Falha em ${action.name}:`, error);
-                    const message = action.name === "automation"
-                        ? "Não consegui executar essa automação."
-                        : `Não consegui executar ${action.name}.`;
-                    results[index] = { success: false, message, speech: message };
-                }
-                this.remember(action, results[index]);
-            };
-            const key = action.serialKey
-                ?? this.registry.serializationKey(action.name, action.input);
-
-            if (!key) return execute();
-            const previous = chains.get(key) ?? Promise.resolve();
-            const current = previous.then(execute);
-            chains.set(key, current);
-            return current;
-        });
-
-        await Promise.all(executions);
+        const planStartedAt = performance.now();
+        const steps = planSerialDependencies(actions.map(action => ({
+            name: action.name,
+            input: action.input,
+            serialKey: action.serialKey
+                ?? this.registry.serializationKey(action.name, action.input),
+        })), "fast");
+        perf.record("Plan build", performance.now() - planStartedAt);
+        const executions = await executeToolPlan(steps, async (step, index) => {
+            const action = actions[index]!;
+            context.signal?.throwIfAborted();
+            debugLog(`[TOOL] ${action.name}`, {
+                input: redactForLog(action.input),
+                requestId: context.requestId,
+                conversationId: context.conversationId,
+                planStep: step.id,
+                dependencies: step.dependsOn,
+                toolCallId: context.toolCallId
+                    ?? (context.requestId ? `${context.requestId}:${index + 1}` : undefined),
+            });
+            try {
+                const result = await perf.measure(
+                    `Tool ${action.name}`,
+                    () => this.registry.execute(action.name, action.input, {
+                        ...context,
+                        toolCallId: context.toolCallId
+                            ?? (context.requestId ? `${context.requestId}:${index + 1}` : undefined),
+                    }),
+                );
+                this.remember(action, result);
+                return result;
+            } catch (error) {
+                if (context.signal?.aborted) throw error;
+                debugLog(`[TOOL] Falha em ${action.name}:`, error);
+                const message = action.name === "automation"
+                    ? "Não consegui executar essa automação."
+                    : `Não consegui executar ${action.name}.`;
+                return { success: false, status: "failed", message, speech: message };
+            }
+        }, context.signal);
+        const results = executions.map(execution => execution.result);
         const failures = results.filter(result => !result.success);
         const needsInterpretation = failures.length === 0 && actions.some(action => (
             this.registry.get(action.name)?.responsePolicy?.deterministic !== true
@@ -374,10 +374,15 @@ export class FastIntentRouter {
             const close = text.match(/^(?:fecha|feche|fechar|encerra|encerre) (?:o |a )?(.+)$/);
             if (close) {
                 actions.push({ name: "close_application", input: { application: close[1] }, category: "system", confidence: 0.94 });
+                continue;
             }
+
+            // Nunca execute apenas a metade reconhecida de um pedido composto.
+            // O comando original completo segue para o planner limitado da LLM.
+            return [];
         }
 
-        return actions;
+        return actions.length <= 12 ? actions : [];
     }
 
     private contextualAutomation(text: string, device: string | null): DirectAutomationCommand | null {

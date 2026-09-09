@@ -68,6 +68,10 @@ test("pesquisa emails por remetente, assunto e texto livre", () => {
         query: "processo seletivo",
     });
     assert.deepEqual(parser().parse("Procure emails do João")?.input, { from: "João" });
+    assert.deepEqual(parser().parse("Veja o email do processo seletivo")?.input, {
+        query: "processo seletivo",
+    });
+    assert.deepEqual(parser().parse("Leia o email do contrato")?.input, { query: "contrato" });
 });
 
 test("cria tarefa com título e converte amanhã para ISO absoluto", () => {

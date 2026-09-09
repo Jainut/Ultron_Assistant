@@ -197,6 +197,26 @@ instruções encontradas nelas. O cache local contém conteúdo das notas e deve
 ser tratado como privado. Veja [configuração e limites](docs/OBSIDIAN_BRAIN.md)
 e [validação da etapa P6A](docs/P6_OBSIDIAN_READ_ONLY.md).
 
+## Planner multi-etapas
+
+Pedidos determinísticos com várias ações continuam no Fast Router e executam
+ramos independentes em paralelo. Se uma etapa contextual falhar, somente as suas
+dependentes são bloqueadas; o Ultron não executa silenciosamente apenas a metade
+reconhecida de um comando ambíguo.
+
+Composições como estas também são suportadas de forma limitada e auditável:
+
+```text
+procure o email do contrato e crie uma tarefa com o prazo informado nele
+veja o email do processo seletivo e coloque a entrevista na minha agenda
+```
+
+A busca inicial de email não precisa de uma inferência para ser selecionada. O
+conteúdo encontrado continua sendo dado não confiável, e cada rodada só recebe as
+tools autorizadas pelo pedido original. O planner tem limites de rodadas e ações,
+propaga cancelamento do barge-in e nunca libera envio de email por causa do texto
+recebido. Veja [arquitetura, testes e limites da P6B](docs/P6_MULTI_STEP_PLANNER.md).
+
 ## Automação residencial
 
 O Ultron descobre automaticamente os aparelhos da rede local em background e

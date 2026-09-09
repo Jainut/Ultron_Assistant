@@ -72,3 +72,33 @@ test("mantém ordem contextual em email seguido de tarefa", () => {
     assert.equal(actions[1]?.serialKey, "personal-context");
     assert.equal(actions[1]?.input.useActiveEmail, true);
 });
+
+test("não executa a metade reconhecida de um pedido composto ambíguo", () => {
+    const router = new FastIntentRouter(parseDirectAutomationCommand);
+    assert.deepEqual(router.planActions("Abra o Spotify e me diga uma piada"), []);
+    assert.deepEqual(router.planActions("Ligue a luz e toque uma música"), []);
+    assert.equal(parseDirectAutomationCommand("Ligue a luz e toque uma música"), null);
+    assert.equal(router.planActions("Abra o Spotify")[0]?.name, "open_application");
+});
+
+test("falha contextual bloqueia a ação seguinte sem bloquear ramo independente", async t => {
+    const calls: string[] = [];
+    t.mock.method(ultronToolRegistry, "execute", async (name: string) => {
+        calls.push(name);
+        if (name === "mail.search") {
+            return { success: false, status: "failed" as const, message: "Email indisponível." };
+        }
+        return { success: true, status: "confirmed" as const, message: "ok" };
+    });
+    const router = new FastIntentRouter(parseDirectAutomationCommand);
+    const result = await router.execute(
+        "Procure o email do processo seletivo e crie uma tarefa para responder esse email amanhã e ligue a luz",
+        { conversationId: "planner-fast" },
+    );
+    assert.deepEqual(calls.sort(), ["control_light", "mail.search"]);
+    assert.deepEqual(result?.actions.map(action => action.name), [
+        "mail.search", "task.create", "control_light",
+    ]);
+    assert.equal(result?.results[1]?.error?.code, "PLAN_DEPENDENCY_BLOCKED");
+    assert.equal(result?.results[2]?.success, true);
+});
