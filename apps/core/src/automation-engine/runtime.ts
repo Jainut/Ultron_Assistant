@@ -190,7 +190,7 @@ function registerUnavailableMonitorAction(type: string): void {
     automationEngine.actions.register(type, () => {
         const error = new Error(
             personalProviderRuntime?.configurationMessage
-                ?? "A conta Google não está configurada para esta automação.",
+                ?? "Nenhum provider pessoal está configurado para esta automação.",
         );
         Object.assign(error, { code: "PROVIDER_NOT_CONFIGURED" });
         throw error;

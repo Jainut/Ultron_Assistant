@@ -5,3 +5,5 @@ export * from "./provider.ts";
 export * from "./task-provider.ts";
 export * from "./types.ts";
 export * from "./google/index.ts";
+export * from "./microsoft/index.ts";
+export * from "./oauth-api-client.ts";

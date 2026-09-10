@@ -115,6 +115,48 @@ test("OAuth desktop valida state, troca PKCE e preserva refresh token", async ()
     assert.equal(tokenRequests.length, 2);
 });
 
+test("OAuth aceita callback localhost e separa offline_access dos scopes do token", async () => {
+    const store = new InMemorySecretStore({ insecurePurpose: "tests-only" });
+    const oauth = new OAuth2DesktopClient({
+        clientId: "microsoft-desktop-client",
+        authorizationEndpoint: "https://login.example.test/authorize",
+        tokenEndpoint: "https://login.example.test/token",
+        scopes: ["offline_access", "Tasks.ReadWrite", "Calendars.ReadWrite"],
+        accessTokenScopes: ["Tasks.ReadWrite", "Calendars.ReadWrite"],
+        redirectHost: "localhost",
+        redirectPath: "/oauth2/microsoft/callback",
+        tokenSecretKey: "microsoft.oauth.tokens",
+    }, store, async (_input, init) => {
+        const form = new URLSearchParams(String(init?.body));
+        assert.equal(form.get("redirect_uri")?.startsWith("http://localhost:"), true);
+        return jsonResponse({
+            access_token: "microsoft-access-token",
+            refresh_token: "microsoft-refresh-token",
+            token_type: "Bearer",
+            expires_in: 3600,
+            scope: "Tasks.ReadWrite Calendars.ReadWrite",
+        });
+    });
+
+    let authorizationUrl: URL | undefined;
+    await oauth.authorizeInteractive({
+        timeoutMs: 5_000,
+        openAuthorizationUrl: async url => {
+            authorizationUrl = url;
+            const callback = new URL(url.searchParams.get("redirect_uri")!);
+            callback.searchParams.set("state", url.searchParams.get("state")!);
+            callback.searchParams.set("code", "microsoft-code");
+            assert.equal((await fetch(callback)).status, 200);
+        },
+    });
+
+    assert.equal(
+        authorizationUrl?.searchParams.get("scope"),
+        "offline_access Tasks.ReadWrite Calendars.ReadWrite",
+    );
+    assert.equal(await oauth.getAccessToken(), "microsoft-access-token");
+});
+
 test("falha ao abrir o navegador cancela imediatamente a espera do callback OAuth", async () => {
     const store = new InMemorySecretStore({ insecurePurpose: "tests-only" });
     const oauth = new OAuth2DesktopClient({

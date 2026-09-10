@@ -54,5 +54,21 @@ set "ULTRON_GOOGLE_TIME_ZONE=America/Sao_Paulo"
 rem Opcional: sobrescreve os scopes padrão de Gmail/Tasks/Calendar.
 set "ULTRON_GOOGLE_SCOPES="
 
+rem Microsoft To Do + Outlook Calendar (OAuth Desktop). Não commite credenciais reais.
+rem Use o Application (client) ID de um app público registrado no Microsoft Entra.
+set "ULTRON_MICROSOFT_CLIENT_ID="
+set "ULTRON_MICROSOFT_CLIENT_SECRET="
+set "ULTRON_MICROSOFT_TENANT=common"
+set "ULTRON_MICROSOFT_TIME_ZONE=America/Sao_Paulo"
+rem Opcional: o Ultron inclui offline_access automaticamente.
+set "ULTRON_MICROSOFT_SCOPES="
+set "ULTRON_MICROSOFT_TASK_LIST_ID="
+set "ULTRON_MICROSOFT_CALENDAR_ID="
+
+rem Com Client ID Microsoft, To Do/Outlook são o padrão; Gmail continua Google.
+rem Use google ou microsoft para sobrescrever cada domínio separadamente.
+set "ULTRON_TASK_PROVIDER="
+set "ULTRON_CALENDAR_PROVIDER="
+
 rem Defina como 1 somente para investigar desempenho e integrações.
 set "ULTRON_DEBUG=0"

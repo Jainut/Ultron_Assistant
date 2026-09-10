@@ -32,6 +32,17 @@ test("conecta a conta Google somente com pedido explícito", () => {
     assert.equal(parser().parse("minha conta Google"), null);
 });
 
+test("conecta a conta Microsoft somente com pedido explícito", () => {
+    assert.deepEqual(parser().parse("Ultron, conecte meu Microsoft 365"), {
+        name: "microsoft.connect",
+        input: {},
+        category: "automation",
+        confidence: 0.99,
+        serialKey: "provider:microsoft",
+    });
+    assert.equal(parser().parse("meu Microsoft To Do"), null);
+});
+
 test("lista ou lê emails novos pelo caminho determinístico mail.list", () => {
     const value = parser().parse("Leia meus emails novos.");
     assert.equal(value?.name, "mail.list");
@@ -114,6 +125,24 @@ test("cria tarefa sem prazo quando título é suficiente, mas rejeita título au
         title: "Comprar café",
     });
     assert.equal(parser().parse("Crie uma tarefa amanhã"), null);
+});
+
+test("entende Microsoft To Do e Outlook como nomes dos providers no caminho rápido", () => {
+    assert.deepEqual(
+        parser().parse("Crie uma tarefa no Microsoft To Do para comprar café amanhã")?.input,
+        {
+            title: "Comprar café",
+            due: "2026-08-21T03:00:00.000Z",
+            timeZone: "America/Sao_Paulo",
+            allDay: true,
+        },
+    );
+    assert.equal(parser().parse("Mostre meu To Do de amanhã")?.name, "task.list");
+
+    const event = parser().parse("Agende no Outlook uma reunião com Ana amanhã às 15h");
+    assert.equal(event?.name, "calendar.create");
+    assert.equal(event?.input.summary, "Reunião com Ana");
+    assert.equal(parser().parse("O que tenho no Outlook amanhã?")?.name, "calendar.list");
 });
 
 test("lista e pesquisa tarefas com filtros absolutos quando informados", () => {

@@ -29,6 +29,8 @@ import {
 } from "../src/providers/types.ts";
 import { ToolRegistry } from "../src/tools/tool-registry.ts";
 import { registerPersonalProviderTools } from "../src/tools/personal/index.ts";
+import { InMemorySecretStore } from "../src/security/secret-store.ts";
+import type { FetchTransport } from "../src/security/oauth2-desktop.ts";
 
 const instant = providerDateTime("2026-08-20T15:00:00.000Z", "America/Sao_Paulo");
 
@@ -80,6 +82,7 @@ function calendarEvent(id = "event-1"): CalendarEvent {
 
 interface FakeCalls {
     connect: number;
+    connectMicrosoft: number;
     send: number;
     deleteTask: number;
     cancelEvent: number;
@@ -91,6 +94,7 @@ interface FakeCalls {
 function fakeRuntime(): { runtime: PersonalProviderRuntime; calls: FakeCalls } {
     const calls: FakeCalls = {
         connect: 0,
+        connectMicrosoft: 0,
         send: 0,
         deleteTask: 0,
         cancelEvent: 0,
@@ -214,6 +218,8 @@ function fakeRuntime(): { runtime: PersonalProviderRuntime; calls: FakeCalls } {
         calls,
         runtime: {
             configured: true,
+            googleConfigured: true,
+            microsoftConfigured: true,
             mail,
             tasks,
             calendar,
@@ -223,6 +229,15 @@ function fakeRuntime(): { runtime: PersonalProviderRuntime; calls: FakeCalls } {
                 return {
                     authorized: true,
                     scopes: ["mail", "tasks", "calendar"],
+                    canRefresh: true,
+                };
+            },
+            async connectMicrosoft(signal) {
+                signal?.throwIfAborted();
+                calls.connectMicrosoft += 1;
+                return {
+                    authorized: true,
+                    scopes: ["Tasks.ReadWrite", "Calendars.ReadWrite"],
                     canRefresh: true,
                 };
             },
@@ -243,6 +258,7 @@ test("registro pessoal expõe catálogo sem iniciar OAuth", () => {
     assert.equal(calls.connect, 0);
     for (const name of [
         "google.connect",
+        "microsoft.connect",
         "mail.list", "mail.search", "mail.read", "mail.thread",
         "mail.summarize", "mail.markRead", "mail.createDraft", "mail.send",
         "task.list", "task.search", "task.get", "task.create",
@@ -281,6 +297,7 @@ test("task.create pode persistir referência untrusted ao email ativo", async ()
     assert.equal(calls.createdTaskInput?.source?.resourceId, "mail-1");
     assert.equal(calls.createdTaskInput?.source?.threadId, "thread-1");
     assert.equal(context.get("task")?.id, "task-1");
+    assert.equal(context.get("task")?.provider, "fake.tasks");
 });
 
 test("conteúdo de email continua marcado untrusted e atualiza contexto", async () => {
@@ -353,6 +370,7 @@ test("criação e cancelamento de evento mantêm contexto e confirmação", asyn
     });
     assert.equal(created.status, "confirmed");
     assert.equal(context.get("calendar-event")?.id, "event-1");
+    assert.equal(context.get("calendar-event")?.provider, "fake.calendar");
 
     const blocked = await registry.execute("calendar.cancel", {}, {
         conversationId: "calendar-cancel-test",
@@ -374,6 +392,112 @@ test("google.connect só inicia OAuth quando a tool é executada explicitamente"
     const result = await registry.execute("google.connect", {});
     assert.equal(result.status, "confirmed");
     assert.equal(calls.connect, 1);
+});
+
+test("microsoft.connect só inicia OAuth quando a tool é executada explicitamente", async () => {
+    const { runtime, calls } = fakeRuntime();
+    const { registry } = registered(runtime);
+    assert.equal(calls.connectMicrosoft, 0);
+
+    const result = await registry.execute("microsoft.connect", {});
+    assert.equal(result.status, "confirmed");
+    assert.equal(calls.connectMicrosoft, 1);
+});
+
+test("runtime Microsoft seleciona To Do e Outlook sem rede ou login no startup", () => {
+    let requests = 0;
+    const transport: FetchTransport = async () => {
+        requests += 1;
+        throw new Error("network must not be called while building runtime");
+    };
+    const runtime = createPersonalProviderRuntimeFromEnv({
+        environment: { ULTRON_MICROSOFT_CLIENT_ID: "microsoft-client" },
+        secretStore: new InMemorySecretStore({ insecurePurpose: "tests-only" }),
+        transport,
+    });
+
+    assert.equal(requests, 0);
+    assert.equal(runtime.configured, true);
+    assert.equal(runtime.microsoftConfigured, true);
+    assert.equal(runtime.googleConfigured, false);
+    assert.equal(runtime.mail, undefined);
+    assert.equal(runtime.tasks?.id, "microsoft.todo");
+    assert.equal(runtime.calendar?.id, "microsoft.calendar");
+    assert.deepEqual(runtime.selections, {
+        tasks: "microsoft",
+        calendar: "microsoft",
+    });
+});
+
+test("runtime híbrido mantém Gmail no Google e permite override de Tasks/Calendar", () => {
+    const options = {
+        secretStore: new InMemorySecretStore({ insecurePurpose: "tests-only" }),
+        transport: async () => {
+            throw new Error("network must not be called while building runtime");
+        },
+    };
+    const hybrid = createPersonalProviderRuntimeFromEnv({
+        ...options,
+        environment: {
+            ULTRON_GOOGLE_CLIENT_ID: "google-client",
+            ULTRON_MICROSOFT_CLIENT_ID: "microsoft-client",
+        },
+    });
+    assert.equal(hybrid.mail?.id, "google.gmail");
+    assert.equal(hybrid.tasks?.id, "microsoft.todo");
+    assert.equal(hybrid.calendar?.id, "microsoft.calendar");
+
+    const google = createPersonalProviderRuntimeFromEnv({
+        ...options,
+        environment: {
+            ULTRON_GOOGLE_CLIENT_ID: "google-client",
+            ULTRON_MICROSOFT_CLIENT_ID: "microsoft-client",
+            ULTRON_TASK_PROVIDER: "google",
+            ULTRON_CALENDAR_PROVIDER: "google",
+        },
+    });
+    assert.equal(google.tasks?.id, "google.tasks");
+    assert.equal(google.calendar?.id, "google.calendar");
+});
+
+test("runtime Microsoft mantém scopes mínimos ao receber scopes adicionais", async () => {
+    let authorizationUrl: URL | undefined;
+    const runtime = createPersonalProviderRuntimeFromEnv({
+        environment: {
+            ULTRON_MICROSOFT_CLIENT_ID: "microsoft-client",
+            ULTRON_MICROSOFT_SCOPES: "Tasks.ReadWrite",
+        },
+        secretStore: new InMemorySecretStore({ insecurePurpose: "tests-only" }),
+        transport: async (_input, init) => {
+            const form = new URLSearchParams(String(init?.body));
+            assert.equal(form.get("grant_type"), "authorization_code");
+            return new Response(JSON.stringify({
+                access_token: "graph-token",
+                refresh_token: "graph-refresh",
+                token_type: "Bearer",
+                expires_in: 3_600,
+                scope: "Tasks.ReadWrite Calendars.ReadWrite",
+            }), {
+                status: 200,
+                headers: { "content-type": "application/json" },
+            });
+        },
+        openMicrosoftAuthorizationUrl: async url => {
+            authorizationUrl = url;
+            const callback = new URL(url.searchParams.get("redirect_uri")!);
+            callback.searchParams.set("state", url.searchParams.get("state")!);
+            callback.searchParams.set("code", "authorization-code");
+            assert.equal((await fetch(callback)).status, 200);
+        },
+    });
+
+    assert.ok(runtime.connectMicrosoft);
+    const state = await runtime.connectMicrosoft();
+    assert.equal(state.authorized, true);
+    assert.equal(
+        authorizationUrl?.searchParams.get("scope"),
+        "offline_access Tasks.ReadWrite Calendars.ReadWrite",
+    );
 });
 
 test("runtime sem client ID falha de modo explícito sem tentar OAuth", async () => {

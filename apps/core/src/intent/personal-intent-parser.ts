@@ -62,7 +62,7 @@ export class PersonalIntentParser {
         const text = normalize(source);
         const temporal = this.temporal.resolve(source);
 
-        return this.parseGoogleConnection(text)
+        return this.parseProviderConnection(text)
             ?? this.parsePersonalAutomation(source, text, temporal)
             ?? this.parseDailyBriefing(text, temporal)
             ?? this.parseNotifications(text)
@@ -76,9 +76,12 @@ export class PersonalIntentParser {
             ?? this.parseCalendarReadAction(source, text, temporal);
     }
 
-    private parseGoogleConnection(text: string): PersonalIntentAction | null {
+    private parseProviderConnection(text: string): PersonalIntentAction | null {
         if (!/\b(?:conecta|conecte|conectar|vincula|vincule|vincular|autoriza|autorize|autorizar)\b/.test(text)) {
             return null;
+        }
+        if (/\b(?:conta\s+microsoft|microsoft(?:\s+365)?|outlook|to\s*do)\b/.test(text)) {
+            return action("microsoft.connect", {}, "automation", 0.99, "provider:microsoft");
         }
         if (!/\b(?:conta\s+google|google|gmail)\b/.test(text)) return null;
 
@@ -255,13 +258,17 @@ export class PersonalIntentParser {
         temporal: TemporalResolution | null,
     ): PersonalIntentAction | null {
         const match = /^(?:cria|crie|criar|adiciona|adicione|adicionar|inclui|inclua|incluir)\s+(?:uma\s+)?tarefa\b/.exec(text);
+        const toDoMatch = /^(?:cria|crie|criar|adiciona|adicione|adicionar|inclui|inclua|incluir)\s+(?:(?:uma\s+)?tarefa\s+)?(?:no|ao)\s+(?:microsoft\s+)?to\s*do\b/.exec(text);
         const reminder = /^(?:me\s+)?(?:lembra|lembre)\s+(?:de\s+)?/.exec(text);
-        if (!match && !reminder) return null;
+        if (!match && !toDoMatch && !reminder) return null;
 
         const originalPrefix = match
             ? /^(?:cria|crie|criar|adiciona|adicione|adicionar|inclui|inclua|incluir)\s+(?:uma\s+)?tarefa\b/iu
-            : /^(?:me\s+)?(?:lembra|lembre)\s+(?:de\s+)?/iu;
+            : toDoMatch
+                ? /^(?:cria|crie|criar|adiciona|adicione|adicionar|inclui|inclua|incluir)\s+(?:(?:uma\s+)?tarefa\s+)?(?:no|ao)\s+(?:microsoft\s+)?to\s*do\b/iu
+                : /^(?:me\s+)?(?:lembra|lembre)\s+(?:de\s+)?/iu;
         let title = source.replace(originalPrefix, "").trim();
+        title = title.replace(/^(?:no|ao)\s+(?:microsoft\s+)?to\s*do\b\s*/iu, "");
         title = title.replace(/^(?:para|pra)(?:\s+eu)?\s+/iu, "");
         title = stripTemporalExpression(title, temporal);
         title = cleanTitle(title);
@@ -337,7 +344,10 @@ export class PersonalIntentParser {
 
         const listVerb = /\b(?:lista|liste|listar|mostra|mostre|mostrar|quais|ver|veja)\b/.test(text)
             || /^(?:minhas|as minhas)\s+(?:tarefas|pendencias|atividades)\b/.test(text);
-        if (!listVerb || !/\b(?:tarefas|pendencias|afazeres|atividades)\b/.test(text)) return null;
+        if (
+            !listVerb
+            || !/\b(?:tarefas|pendencias|afazeres|atividades|to\s*do)\b/.test(text)
+        ) return null;
 
         const input: Record<string, unknown> = {};
         if (temporal) {
@@ -364,7 +374,10 @@ export class PersonalIntentParser {
             /^(?:marca|marque|marcar|agenda|agende|agendar|cria|crie|criar|adiciona|adicione|adicionar)\s+/iu,
             "",
         );
-        summary = summary.replace(/^(?:no\s+calendario|na\s+agenda)\s+/iu, "");
+        summary = summary.replace(
+            /^(?:(?:no|ao)\s+(?:microsoft\s+)?outlook(?:\s+calendar)?|no\s+calendario|na\s+agenda)\s+/iu,
+            "",
+        );
         summary = summary.replace(/^(?:um|uma)\s+/iu, "");
         summary = stripTemporalExpression(summary, temporal);
         summary = cleanTitle(summary);
@@ -426,7 +439,7 @@ export class PersonalIntentParser {
             }, "calendar", 0.95);
         }
 
-        const asksAgenda = /\b(?:agenda|calendario|compromissos|eventos|reunioes)\b/.test(text)
+        const asksAgenda = /\b(?:agenda|calendario|outlook|compromissos|eventos|reunioes)\b/.test(text)
             || /\b(?:tenho|ha|tem)\b.*\b(?:algo|alguma coisa|compromisso|reuniao|evento)\b/.test(text)
             || /^(?:o que|que compromissos?|quais compromissos?)\s+(?:eu\s+)?tenho\b/.test(text);
         if (!asksAgenda || !temporal) return null;

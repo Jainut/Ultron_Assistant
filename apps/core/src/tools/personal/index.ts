@@ -4,14 +4,14 @@ import {
 } from "../../context/operational-context.ts";
 import {
     createPersonalProviderRuntimeFromEnv,
-    type GooglePersonalProviderRuntimeOptions,
+    type PersonalProviderRuntimeOptions,
     type PersonalProviderRuntime,
 } from "../../providers/personal-provider-runtime.ts";
 import type { ToolRegistry } from "../tool-registry.ts";
 import type { ToolDefinition } from "../tool.ts";
 import { createCalendarTools } from "./calendar.tools.ts";
 import { createMailTools } from "./mail.tools.ts";
-import { createGoogleConnectTool } from "./provider.tools.ts";
+import { createGoogleConnectTool, createMicrosoftConnectTool } from "./provider.tools.ts";
 import { createTaskTools } from "./task.tools.ts";
 
 export * from "./calendar.tools.ts";
@@ -22,7 +22,7 @@ export * from "./task.tools.ts";
 
 export interface PersonalToolRegistrationOptions {
     readonly runtime?: PersonalProviderRuntime;
-    readonly runtimeOptions?: GooglePersonalProviderRuntimeOptions;
+    readonly runtimeOptions?: PersonalProviderRuntimeOptions;
     readonly contextStore?: OperationalContext;
 }
 
@@ -34,6 +34,7 @@ export function createPersonalProviderTools(
 ): readonly AnyPersonalTool[] {
     return [
         createGoogleConnectTool(runtime),
+        createMicrosoftConnectTool(runtime),
         ...createMailTools(runtime, contextStore),
         ...createTaskTools(runtime, contextStore),
         ...createCalendarTools(runtime, contextStore),

@@ -83,11 +83,12 @@ aberta e preserva o comportamento anterior. Essa camada é um gate acústico
 conservador, não um AEC adaptativo completo. O benchmark e os limites estão em
 [`docs/P3_ACOUSTIC_ECHO_REFERENCE_VALIDATION.md`](docs/P3_ACOUSTIC_ECHO_REFERENCE_VALIDATION.md).
 
-## Gmail, Google Tasks e Calendar
+## Contas pessoais: Google e Microsoft 365
 
-As três integrações usam o mesmo OAuth 2.0 para aplicativo Desktop, com PKCE e
-callback loopback em `127.0.0.1`. O Ultron nunca abre o login durante o startup:
-ele só inicia a autorização quando você diz `conecte minha conta Google`.
+Gmail, Google Tasks e Google Calendar continuam disponíveis pelo OAuth 2.0
+Desktop já existente, com PKCE e callback loopback em `127.0.0.1`. O Ultron
+nunca abre o login durante o startup: ele só inicia a autorização quando você
+diz `conecte minha conta Google`.
 
 1. No Google Cloud, habilite Gmail API, Google Tasks API e Google Calendar API.
 2. Crie um OAuth Client do tipo **Desktop app**.
@@ -97,9 +98,31 @@ ele só inicia a autorização quando você diz `conecte minha conta Google`.
 
 O fluxo segue a documentação oficial de [OAuth para aplicativos Desktop com
 PKCE e loopback](https://developers.google.com/identity/protocols/oauth2/native-app).
+
+Microsoft To Do e Outlook Calendar usam Microsoft Graph, também via OAuth
+Desktop com PKCE, sem nova dependência pesada. Para habilitar:
+
+1. No Microsoft Entra, crie um registro de aplicativo que aceite a sua conta
+   Microsoft (pessoal e/ou organizacional).
+2. Em **Authentication**, adicione a plataforma **Mobile and desktop
+   applications**, cadastre
+   `http://localhost/oauth2/microsoft/callback` e habilite o fluxo de cliente
+   público. Não é necessário client secret para o app público local.
+3. Em **API permissions**, adicione as permissões delegadas do Microsoft Graph
+   `Tasks.ReadWrite` e `Calendars.ReadWrite`.
+4. Copie o **Application (client) ID** para
+   `ULTRON_MICROSOFT_CLIENT_ID` no `ultron.env.cmd`.
+5. Inicie o Ultron e diga `conecte minha conta Microsoft`.
+
+Quando os Client IDs Google e Microsoft estão configurados juntos, Gmail fica
+no Google e Tasks/Calendar passam a usar Microsoft To Do e Outlook Calendar por
+padrão. `ULTRON_TASK_PROVIDER` e `ULTRON_CALENDAR_PROVIDER` aceitam `google` ou
+`microsoft` para escolher cada domínio sem remover a implementação anterior.
+
 Os tokens ficam cifrados pelo DPAPI `CurrentUser` em
-`%LOCALAPPDATA%\Ultron\secrets.dpapi.json`; tokens e conteúdo de email não são
-gravados em logs nem enviados como instruções.
+`%LOCALAPPDATA%\Ultron\secrets.dpapi.json`; tokens e conteúdo remoto não são
+gravados em logs nem enviados como instruções. A configuração e os limites do
+Graph estão em [P6D: Microsoft To Do e Outlook Calendar](docs/P6_MICROSOFT_PROVIDERS.md).
 
 Exemplos do caminho rápido:
 
@@ -120,9 +143,9 @@ da conversa atual; `não` ou `cancela` descarta a ação.
 ## Automações pessoais persistentes
 
 O Automation Core salva agendas e monitores em `data/` e os recupera depois de
-reiniciar o Ultron. A conta Google precisa estar configurada antes de criar uma
-automação que dependa dela; caso contrário, o comando falha sem deixar um job
-quebrado para trás.
+reiniciar o Ultron. O provider pessoal correspondente precisa estar configurado
+antes de criar uma automação que dependa dele; caso contrário, o comando falha
+sem deixar um job quebrado para trás.
 
 ```text
 todo dia às 8 me diga meus compromissos e tarefas

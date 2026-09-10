@@ -87,8 +87,8 @@ function modelTools(input: string, names?: readonly string[]): Tool[] {
     if (/\b(hora|horario)\b/.test(text)) categories.add("information");
     if (/\b(obsidian|notas|nota|anotacao|anotacoes|backlinks|vault)\b/.test(text)) categories.add("memory");
     if (/\b(email|emails|gmail|mensagem|remetente|assunto)\b/.test(text)) categories.add("mail");
-    if (/\b(tarefa|tarefas|pendencia|pendencias)\b/.test(text)) categories.add("tasks");
-    if (/\b(agenda|calendario|evento|reuniao|compromisso)\b/.test(text)) categories.add("calendar");
+    if (/\b(tarefa|tarefas|pendencia|pendencias|to\s*do)\b/.test(text)) categories.add("tasks");
+    if (/\b(agenda|calendario|outlook|evento|reuniao|compromisso)\b/.test(text)) categories.add("calendar");
     if (/\b(lembre|avise|quando|todo dia|toda semana|automacao)\b/.test(text)) categories.add("automation");
 
     return ultronToolRegistry.modelSchemas(
@@ -1451,7 +1451,7 @@ function shouldUseToolPath(
     }
 
     if (
-        /\b(email|emails|gmail|remetente|assunto|tarefa|tarefas|pendencia|agenda|calendario|evento|eventos|reuniao|compromisso|google|automacao|automacoes|lembre|avise)\b/.test(text)
+        /\b(email|emails|gmail|remetente|assunto|tarefa|tarefas|to\s*do|pendencia|agenda|calendario|outlook|evento|eventos|reuniao|compromisso|google|microsoft|automacao|automacoes|lembre|avise)\b/.test(text)
     ) {
         return true;
     }

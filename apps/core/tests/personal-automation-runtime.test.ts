@@ -21,6 +21,7 @@ test("runtime registra automações pessoais no registry e engine uma única vez
         "automation.createCalendarReminder",
         "notification.list",
         "notification.markRead",
+        "microsoft.connect",
     ]) {
         assert.equal(ultronToolRegistry.has(name), true, `${name} ausente no ToolRegistry`);
     }

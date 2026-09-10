@@ -15,8 +15,11 @@ export interface OAuth2DesktopConfig {
     readonly authorizationEndpoint: string;
     readonly tokenEndpoint: string;
     readonly scopes: readonly string[];
+    /** Scopes expected in access-token responses; defaults to every requested scope. */
+    readonly accessTokenScopes?: readonly string[];
     readonly tokenSecretKey: string;
     readonly redirectPath?: `/${string}`;
+    readonly redirectHost?: "127.0.0.1" | "localhost";
     readonly additionalAuthorizationParameters?: Readonly<Record<string, string>>;
 }
 
@@ -133,8 +136,9 @@ export class OAuth2DesktopClient {
         let callback: Promise<string> | undefined;
 
         try {
-            const port = await listenOnLoopback(server, options.signal);
-            const redirectUri = `http://127.0.0.1:${port}${this.config.redirectPath}`;
+            const redirectHost = this.config.redirectHost ?? "127.0.0.1";
+            const port = await listenOnLoopback(server, redirectHost, options.signal);
+            const redirectUri = `http://${redirectHost}:${port}${this.config.redirectPath}`;
             const authorizationUrl = this.buildAuthorizationUrl(
                 redirectUri,
                 state,
@@ -345,7 +349,8 @@ export class OAuth2DesktopClient {
 
     private hasRequiredScopes(tokens: OAuth2TokenSet): boolean {
         const granted = new Set(tokens.scopes);
-        return this.config.scopes.every(scope => granted.has(scope));
+        return (this.config.accessTokenScopes ?? this.config.scopes)
+            .every(scope => granted.has(scope));
     }
 
     private async loadTokens(signal?: AbortSignal): Promise<OAuth2TokenSet | null> {
@@ -479,7 +484,11 @@ function waitForAuthorizationCallback(
     });
 }
 
-function listenOnLoopback(server: Server, signal?: AbortSignal): Promise<number> {
+function listenOnLoopback(
+    server: Server,
+    host: "127.0.0.1" | "localhost",
+    signal?: AbortSignal,
+): Promise<number> {
     signal?.throwIfAborted();
     return new Promise<number>((resolve, reject) => {
         const onAbort = (): void => {
@@ -488,7 +497,7 @@ function listenOnLoopback(server: Server, signal?: AbortSignal): Promise<number>
         };
         signal?.addEventListener("abort", onAbort, { once: true });
         server.once("error", reject);
-        server.listen(0, "127.0.0.1", () => {
+        server.listen(0, host, () => {
             signal?.removeEventListener("abort", onAbort);
             server.removeListener("error", reject);
             const address = server.address();
@@ -567,6 +576,24 @@ function validateOAuthConfig(config: OAuth2DesktopConfig): void {
     }
     if (config.scopes.length === 0 || config.scopes.some(scope => !scope.trim())) {
         throw new OAuth2Error("Ao menos um scope OAuth é obrigatório.", "configuration");
+    }
+    if (
+        config.accessTokenScopes !== undefined
+        && (
+            config.accessTokenScopes.length === 0
+            || config.accessTokenScopes.some(scope => (
+                !scope.trim() || !config.scopes.includes(scope)
+            ))
+        )
+    ) {
+        throw new OAuth2Error("Scopes de access token OAuth inválidos.", "configuration");
+    }
+    if (
+        config.redirectHost !== undefined
+        && config.redirectHost !== "127.0.0.1"
+        && config.redirectHost !== "localhost"
+    ) {
+        throw new OAuth2Error("Host de loopback OAuth inválido.", "configuration");
     }
     if (!config.tokenSecretKey.trim()) {
         throw new OAuth2Error("Chave segura dos tokens é obrigatória.", "configuration");

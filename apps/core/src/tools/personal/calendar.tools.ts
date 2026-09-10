@@ -122,7 +122,7 @@ export function createCalendarTools(
         successStatus: "confirmed",
         responsePolicy: { deterministic: false },
         async execute(input, toolContext) {
-            if (!runtime.calendar) return providerUnavailable(runtime, "Google Calendar");
+            if (!runtime.calendar) return providerUnavailable(runtime, "calendário");
             const page = await runtime.calendar.listEvents({
                 calendarId: nonEmpty(input.calendarId),
                 timeMin: parseProviderDateTime(input.timeMin, input.timeZone),
@@ -131,7 +131,7 @@ export function createCalendarTools(
                 includeCancelled: input.includeCancelled,
                 signal: toolContext.signal,
             });
-            rememberEvent(page.items[0], contextStore);
+            rememberEvent(page.items[0], runtime.calendar.id, contextStore);
             return {
                 success: true,
                 status: "confirmed",
@@ -164,7 +164,7 @@ export function createCalendarTools(
         successStatus: "confirmed",
         responsePolicy: { deterministic: false },
         async execute(input, toolContext) {
-            if (!runtime.calendar) return providerUnavailable(runtime, "Google Calendar");
+            if (!runtime.calendar) return providerUnavailable(runtime, "calendário");
             const page = await runtime.calendar.searchEvents({
                 query: input.query,
                 calendarId: nonEmpty(input.calendarId),
@@ -174,7 +174,7 @@ export function createCalendarTools(
                 includeCancelled: input.includeCancelled,
                 signal: toolContext.signal,
             });
-            rememberEvent(page.items[0], contextStore);
+            rememberEvent(page.items[0], runtime.calendar.id, contextStore);
             return {
                 success: true,
                 status: "confirmed",
@@ -213,7 +213,7 @@ export function createCalendarTools(
             format: result => result.success ? result.message : result.message,
         },
         async execute(input, toolContext) {
-            if (!runtime.calendar) return providerUnavailable(runtime, "Google Calendar");
+            if (!runtime.calendar) return providerUnavailable(runtime, "calendário");
             const conflicts = await runtime.calendar.findConflicts(
                 parseProviderDateTime(input.start, input.timeZone),
                 parseProviderDateTime(input.end, input.timeZone),
@@ -221,7 +221,7 @@ export function createCalendarTools(
                 { signal: toolContext.signal },
                 nonEmpty(input.excludeEventId),
             );
-            rememberEvent(conflicts[0], contextStore);
+            rememberEvent(conflicts[0], runtime.calendar.id, contextStore);
             const message = conflicts.length === 0
                 ? "Nenhum conflito encontrado."
                 : `${conflicts.length} conflito(s) encontrado(s).`;
@@ -258,7 +258,7 @@ export function createCalendarTools(
             format: result => result.success ? "Evento criado." : result.message,
         },
         async execute(input, toolContext) {
-            if (!runtime.calendar) return providerUnavailable(runtime, "Google Calendar");
+            if (!runtime.calendar) return providerUnavailable(runtime, "calendário");
             const createInput: CreateCalendarEventInput = {
                 summary: input.summary,
                 description: input.description,
@@ -273,11 +273,11 @@ export function createCalendarTools(
             const event = await runtime.calendar.createEvent(createInput, {
                 signal: toolContext.signal,
             });
-            rememberEvent(event, contextStore);
+            rememberEvent(event, runtime.calendar.id, contextStore);
             return {
                 success: true,
                 status: "confirmed",
-                message: "Evento criado no Google Calendar.",
+                message: `Evento criado no ${runtime.calendar.displayName}.`,
                 speech: "Evento criado.",
                 data: untrustedToolData(event),
             };
@@ -312,7 +312,7 @@ export function createCalendarTools(
             format: result => result.success ? "Evento atualizado." : result.message,
         },
         async execute(input, toolContext) {
-            if (!runtime.calendar) return providerUnavailable(runtime, "Google Calendar");
+            if (!runtime.calendar) return providerUnavailable(runtime, "calendário");
             const eventId = resolveEventId(input.eventId, contextStore);
             if (!eventId) return missingEventReference();
             const updateInput: UpdateCalendarEventInput = {
@@ -333,7 +333,7 @@ export function createCalendarTools(
             const event = await runtime.calendar.updateEvent(eventId, updateInput, {
                 signal: toolContext.signal,
             });
-            rememberEvent(event, contextStore);
+            rememberEvent(event, runtime.calendar.id, contextStore);
             return {
                 success: true,
                 status: "confirmed",
@@ -367,7 +367,7 @@ export function createCalendarTools(
             format: result => result.success ? "Evento cancelado." : result.message,
         },
         async execute(input, toolContext) {
-            if (!runtime.calendar) return providerUnavailable(runtime, "Google Calendar");
+            if (!runtime.calendar) return providerUnavailable(runtime, "calendário");
             const eventId = resolveEventId(input.eventId, contextStore);
             if (!eventId) return missingEventReference();
             await runtime.calendar.cancelEvent(
@@ -397,12 +397,16 @@ function resolveEventId(
     return nonEmpty(requested) ?? contextStore.get("calendar-event")?.id;
 }
 
-function rememberEvent(event: CalendarEvent | undefined, contextStore: OperationalContext): void {
+function rememberEvent(
+    event: CalendarEvent | undefined,
+    providerId: string,
+    contextStore: OperationalContext,
+): void {
     if (!event) return;
     contextStore.set({
         type: "calendar-event",
         id: event.id,
-        provider: "google.calendar",
+        provider: providerId,
         metadata: {
             calendarId: event.calendarId,
             externalSummary: event.summary,

@@ -48,7 +48,7 @@ export function createPlannerPolicy(input: string): PlannerPolicy {
 
     const goals: string[] = [];
     const taskCreation =
-        /\b(?:cria|crie|criar|adiciona|adicione|adicionar|inclui|inclua|incluir|coloca|coloque)\b[\s\S]*\b(?:tarefa|tasks?|pendencia)\b/.test(
+        /\b(?:cria|crie|criar|adiciona|adicione|adicionar|inclui|inclua|incluir|coloca|coloque)\b[\s\S]*\b(?:tarefa|tasks?|to\s*do|pendencia)\b/.test(
             text,
         );
     const calendarCreation =

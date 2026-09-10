@@ -84,9 +84,8 @@ na inicialização, confira minhas tarefas
 - Providers adicionais continuam dependendo da escolha do serviço e das
   credenciais que o usuário pretende conectar. Nenhum provider foi presumido.
 
-## Próxima etapa
+## Continuação
 
-P6D: adicionar outro provider pessoal de forma opt-in, preservando as interfaces
-`MailProvider`, `TaskProvider` e `CalendarProvider`. A escolha concreta do serviço
-é necessária antes da implementação para não adicionar OAuth, dependências e
-permissões que o usuário não pretende usar.
+A P6D adicionou Microsoft To Do e Outlook Calendar de forma opt-in, preservando
+as interfaces `TaskProvider` e `CalendarProvider`. A composição por domínio e os
+limites estão documentados em [P6_MICROSOFT_PROVIDERS.md](P6_MICROSOFT_PROVIDERS.md).
