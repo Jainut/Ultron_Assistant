@@ -4,6 +4,7 @@ import test from "node:test";
 import {
     createDailyBriefingTool,
     DailyBriefingService,
+    formatDailyBriefingCountMessage,
     type DailyBriefingNotification,
 } from "../src/personal-automation/index.ts";
 import type {
@@ -99,6 +100,56 @@ test("Daily Briefing inicia as três consultas em paralelo e classifica o dia ab
     assert.equal(briefing.mail.attention[0]?.subject.trust, "untrusted");
     assert.deepEqual(briefing.availableSources, ["calendar", "tasks", "mail"]);
     assert.equal(briefing.errors.length, 0);
+});
+
+test("seleção de fontes evita providers desnecessários e limita a resposta", async () => {
+    let calendarCalls = 0;
+    let taskCalls = 0;
+    let mailCalls = 0;
+    const runtime = fakeRuntime({
+        async calendarList() {
+            calendarCalls += 1;
+            return [];
+        },
+        async taskList() {
+            taskCalls += 1;
+            return [];
+        },
+        async mailSearch() {
+            mailCalls += 1;
+            return [mail("important", { unread: true, labels: ["UNREAD", "IMPORTANT"] })];
+        },
+    });
+
+    const briefing = await new DailyBriefingService(runtime).generate({
+        at: AT,
+        sources: ["mail"],
+    });
+
+    assert.equal(calendarCalls, 0);
+    assert.equal(taskCalls, 0);
+    assert.equal(mailCalls, 1);
+    assert.deepEqual(briefing.availableSources, ["mail"]);
+    assert.equal(briefing.errors.length, 0);
+    const message = formatDailyBriefingCountMessage(briefing.counts, ["mail"]);
+    assert.match(message, /1 email\(s\) não lido\(s\)/);
+    assert.equal(message.includes("evento"), false);
+    assert.equal(message.includes("tarefa"), false);
+});
+
+test("seleção de fontes rejeita listas vazias ou valores desconhecidos", async () => {
+    const service = new DailyBriefingService(fakeRuntime());
+    await assert.rejects(
+        service.generate({ at: AT, sources: [] }),
+        RangeError,
+    );
+    await assert.rejects(
+        service.generate({
+            at: AT,
+            sources: ["unknown" as unknown as "mail"],
+        }),
+        TypeError,
+    );
 });
 
 test("falha parcial preserva seções disponíveis e não vaza detalhes do erro", async () => {

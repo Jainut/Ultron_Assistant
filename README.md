@@ -126,6 +126,7 @@ quebrado para trás.
 
 ```text
 todo dia às 8 me diga meus compromissos e tarefas
+quando eu ligar o computador, veja se chegou algum email importante
 quando chegar um email do GitHub sobre workflow falhando, me avisa
 me avisa quinze minutos antes das reuniões
 quais avisos pendentes eu tenho?
@@ -137,6 +138,13 @@ Calendar Reminder fazem polling em background, deduplicam eventos já avisados e
 publicam no Notification Center persistente. Texto vindo de email ou calendário
 é sempre marcado como dado externo não confiável: pode ser mostrado ou falado,
 mas nunca vira instrução nem executa outra tool automaticamente.
+
+Briefings agendados e de inicialização consultam somente as fontes citadas no
+pedido. Assim, uma verificação apenas de email não espera Calendar nem Tasks. O
+gatilho de inicialização ocorre na próxima abertura real do Ultron; iniciar o
+mesmo engine novamente por recuperação interna não duplica a execução. Esta
+etapa não cadastra o Ultron no auto-start do Windows. Veja
+[P6C: automação composta de inicialização](docs/P6_STARTUP_AUTOMATION.md).
 
 ## Caminho rápido e contexto
 

@@ -16,6 +16,7 @@ test("runtime registra automações pessoais no registry e engine uma única vez
     for (const name of [
         "personal.dailyBriefing",
         "automation.createDailyBriefing",
+        "automation.createStartupBriefing",
         "automation.createEmailWatch",
         "automation.createCalendarReminder",
         "notification.list",

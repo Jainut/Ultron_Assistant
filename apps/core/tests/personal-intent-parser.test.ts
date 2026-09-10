@@ -296,11 +296,42 @@ test("agenda briefing diário com horário de parede", () => {
         parser().parse("Todo dia às 8 me diga meus compromissos e tarefas."),
         {
             name: "automation.createDailyBriefing",
-            input: { time: "08:00", timeZone: "America/Sao_Paulo" },
+            input: {
+                time: "08:00",
+                timeZone: "America/Sao_Paulo",
+                sources: ["calendar", "tasks"],
+            },
             category: "automation",
             confidence: 0.98,
             serialKey: "automation:daily-briefing",
         },
+    );
+});
+
+test("agenda verificação de fontes pessoais na inicialização", () => {
+    assert.deepEqual(
+        parser().parse("Quando eu ligar o computador, veja se chegou algum email importante."),
+        {
+            name: "automation.createStartupBriefing",
+            input: { sources: ["mail"] },
+            category: "automation",
+            confidence: 0.98,
+            serialKey: "automation:startup-briefing",
+        },
+    );
+    assert.deepEqual(
+        parser().parse("Ao iniciar o Windows, mostre minha agenda, tarefas e emails."),
+        {
+            name: "automation.createStartupBriefing",
+            input: { sources: ["calendar", "tasks", "mail"] },
+            category: "automation",
+            confidence: 0.98,
+            serialKey: "automation:startup-briefing",
+        },
+    );
+    assert.equal(
+        parser().parse("Quando chegar um email do GitHub sobre workflow falhando, me avisa.")?.name,
+        "automation.createEmailWatch",
     );
 });
 

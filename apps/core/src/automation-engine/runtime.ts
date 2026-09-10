@@ -10,6 +10,7 @@ import { debugLog } from "../utils/debug.ts";
 import { notificationCenter } from "../notifications/runtime.ts";
 import {
     createDailyBriefingAutomationTool,
+    createStartupBriefingAutomationTool,
     createCalendarReminderAction,
     createMailWatchAction,
     createMonitorStateStore,
@@ -52,21 +53,29 @@ export function registerToolActions(): void {
         calendar: Boolean(personalProviderRuntime?.calendar),
         message: personalProviderRuntime?.configurationMessage,
     };
+    const briefingAvailability = {
+        available: Boolean(
+            personalProviderRuntime?.configured
+            && (
+                personalProviderRuntime.mail
+                || personalProviderRuntime.tasks
+                || personalProviderRuntime.calendar
+            )
+        ),
+        message: personalProviderRuntime?.configurationMessage,
+    };
     if (!ultronToolRegistry.has("automation.createDailyBriefing")) {
         ultronToolRegistry.register(createDailyBriefingAutomationTool(
             automationEngine,
             defaultTimezone,
-            {
-                available: Boolean(
-                    personalProviderRuntime?.configured
-                    && (
-                        personalProviderRuntime.mail
-                        || personalProviderRuntime.tasks
-                        || personalProviderRuntime.calendar
-                    )
-                ),
-                message: personalProviderRuntime?.configurationMessage,
-            },
+            briefingAvailability,
+        ));
+    }
+    if (!ultronToolRegistry.has("automation.createStartupBriefing")) {
+        ultronToolRegistry.register(createStartupBriefingAutomationTool(
+            automationEngine,
+            defaultTimezone,
+            briefingAvailability,
         ));
     }
     registerPersonalMonitorTools(ultronToolRegistry, automationEngine, {

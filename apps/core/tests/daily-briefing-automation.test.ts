@@ -5,7 +5,10 @@ import path from "node:path";
 import test from "node:test";
 
 import { AutomationEngine } from "../src/automation-engine/automation-engine.ts";
-import { createDailyBriefingAutomationTool } from "../src/personal-automation/daily-briefing-automation.tool.ts";
+import {
+    createDailyBriefingAutomationTool,
+    type CreateDailyBriefingAutomationInput,
+} from "../src/personal-automation/daily-briefing-automation.tool.ts";
 import { ToolRegistry } from "../src/tools/tool-registry.ts";
 
 test("agenda daily briefing de forma persistente e idempotente", async () => {
@@ -77,6 +80,50 @@ test("criação concorrente não duplica e parâmetros operacionais diferentes n
         assert.equal(moreEmails.data?.created, true);
         assert.equal((await engine.listAutomations()).length, 3);
         assert.equal((await engine.jobs.list()).length, 3);
+    } finally {
+        await rm(directory, { recursive: true, force: true });
+    }
+});
+
+test("fontes são canônicas e maxEmails não diferencia resumo sem email", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "ultron-daily-sources-"));
+    try {
+        const engine = new AutomationEngine({
+            storageDirectory: directory,
+            defaultTimezone: "America/Sao_Paulo",
+        });
+        const tool = createDailyBriefingAutomationTool(engine);
+        const input: CreateDailyBriefingAutomationInput = {
+            time: "08:00",
+            sources: ["tasks", "calendar"],
+            maxEmails: 10,
+        };
+
+        const first = await tool.execute(input, {});
+        const reordered = await tool.execute({
+            ...input,
+            sources: ["calendar", "tasks"],
+            maxEmails: 80,
+        }, {});
+        const mailOnly = await tool.execute({
+            time: "08:00",
+            sources: ["mail"],
+            maxEmails: 10,
+        }, {});
+
+        assert.equal(first.data?.created, true);
+        assert.equal(reordered.data?.created, false);
+        assert.equal(mailOnly.data?.created, true);
+        const automations = await engine.listAutomations();
+        assert.equal(automations.length, 2);
+        const actionInput = automations.find(value => (
+            value.metadata?.fingerprint === first.data?.automation.metadata?.fingerprint
+        ))?.actions[0]?.input;
+        assert.deepEqual(actionInput, {
+            timeZone: "America/Sao_Paulo",
+            publishNotification: true,
+            sources: ["calendar", "tasks"],
+        });
     } finally {
         await rm(directory, { recursive: true, force: true });
     }

@@ -94,6 +94,20 @@ export class PersonalIntentParser {
         const activeThreadId = typeof this.context.activeEmail?.metadata?.threadId === "string"
             ? this.context.activeEmail.metadata.threadId
             : undefined;
+        const startupTrigger = /\b(?:quando|sempre que|ao)\b[\s\S]{0,48}\b(?:ligar|iniciar|abrir)\b[\s\S]{0,28}\b(?:computador|pc|windows|ultron)\b/.test(text)
+            || /\b(?:na|a cada)\s+inicializacao\b[\s\S]{0,24}\b(?:computador|pc|windows|ultron)?\b/.test(text);
+        const startupCheck = /\b(?:veja|verifique|verificar|confira|conferir|checa|cheque|mostra|mostre|diga|fale|resuma)\b/.test(text)
+            && /\b(?:email|emails|gmail|agenda|calendario|compromisso|compromissos|reuniao|reunioes|evento|eventos|tarefa|tarefas|pendencia|pendencias|meu dia)\b/.test(text);
+        if (startupTrigger && startupCheck) {
+            const sources = extractBriefingSources(text);
+            return action(
+                "automation.createStartupBriefing",
+                sources.length ? { sources } : {},
+                "automation",
+                0.98,
+                "automation:startup-briefing",
+            );
+        }
 
         if (
             notificationVerb
@@ -142,11 +156,13 @@ export class PersonalIntentParser {
         const asksBriefing = /\b(?:briefing|resumo|compromissos|agenda|tarefas|meu\s+dia)\b/.test(text)
             && /\b(?:diga|fale|mostra|mostre|avisa|avise|resumo|briefing)\b/.test(text);
         if (recurring && asksBriefing) {
+            const sources = extractBriefingSources(text);
             return action(
                 "automation.createDailyBriefing",
                 {
                     time: extractRecurringClock(text) ?? "08:00",
                     timeZone: temporal?.timeZone ?? "America/Sao_Paulo",
+                    ...(sources.length ? { sources } : {}),
                 },
                 "automation",
                 0.98,
@@ -537,6 +553,18 @@ function extractRecurringClock(text: string): string | null {
     if (/\b(?:de|a)\s+tarde\b/.test(text)) return "14:00";
     if (/\b(?:de|a)\s+noite\b/.test(text)) return "20:00";
     return null;
+}
+
+function extractBriefingSources(text: string): Array<"calendar" | "tasks" | "mail"> {
+    const sources: Array<"calendar" | "tasks" | "mail"> = [];
+    if (/\b(?:agenda|calendario|compromisso|compromissos|reuniao|reunioes|evento|eventos)\b/.test(text)) {
+        sources.push("calendar");
+    }
+    if (/\b(?:tarefa|tarefas|pendencia|pendencias)\b/.test(text)) {
+        sources.push("tasks");
+    }
+    if (/\b(?:email|emails|gmail)\b/.test(text)) sources.push("mail");
+    return sources;
 }
 
 function extractTaskCompletionTitle(source: string): string | null {

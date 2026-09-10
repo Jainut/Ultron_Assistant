@@ -20,6 +20,14 @@ export type DailyBriefingErrorSource =
     | "mail"
     | "notification";
 
+export type DailyBriefingSource = Exclude<DailyBriefingErrorSource, "notification">;
+
+const ALL_DAILY_BRIEFING_SOURCES: readonly DailyBriefingSource[] = [
+    "calendar",
+    "tasks",
+    "mail",
+];
+
 export interface DailyBriefingSectionError {
     readonly source: DailyBriefingErrorSource;
     readonly code: string;
@@ -62,7 +70,7 @@ export interface DailyBriefing {
     readonly tasks: DailyBriefingTaskSection;
     readonly mail: DailyBriefingMailSection;
     readonly counts: DailyBriefingCounts;
-    readonly availableSources: readonly ("calendar" | "tasks" | "mail")[];
+    readonly availableSources: readonly DailyBriefingSource[];
     readonly errors: readonly DailyBriefingSectionError[];
     readonly notificationPublished: boolean;
 }
@@ -99,6 +107,7 @@ export interface GenerateDailyBriefingInput {
     readonly at?: Date;
     readonly timeZone?: string;
     readonly maxEmails?: number;
+    readonly sources?: readonly DailyBriefingSource[];
     readonly publishNotification?: boolean;
     readonly signal?: AbortSignal;
 }
@@ -153,11 +162,19 @@ export class DailyBriefingService {
         const timeZone = checkedTimeZone(input.timeZone ?? this.defaultTimeZone);
         const day = resolveDayRange(generatedAtDate, timeZone);
         const maxEmails = clampMaxEmails(input.maxEmails, this.defaultMaxEmails);
+        const requestedSources = normalizeDailyBriefingSources(input.sources);
+        const requested = new Set(requestedSources);
 
         const settled = await Promise.allSettled([
-            this.loadCalendar(day, input.signal),
-            this.loadTasks(day, input.signal),
-            this.loadMail(maxEmails, input.signal),
+            requested.has("calendar")
+                ? this.loadCalendar(day, input.signal)
+                : Promise.resolve([] as readonly CalendarEvent[]),
+            requested.has("tasks")
+                ? this.loadTasks(day, input.signal)
+                : Promise.resolve([] as readonly ProviderTask[]),
+            requested.has("mail")
+                ? this.loadMail(maxEmails, input.signal)
+                : Promise.resolve([] as readonly MailMessageSummary[]),
         ] as const);
         input.signal?.throwIfAborted();
         const cancelled = settled.find(result =>
@@ -168,36 +185,42 @@ export class DailyBriefingService {
         }
 
         const errors: DailyBriefingSectionError[] = [];
-        const availableSources: Array<"calendar" | "tasks" | "mail"> = [];
+        const availableSources: DailyBriefingSource[] = [];
 
         const calendarResult = settled[0];
         const eventsToday = calendarResult.status === "fulfilled"
             ? calendarResult.value
             : [];
-        if (calendarResult.status === "fulfilled") {
-            availableSources.push("calendar");
-        } else {
-            errors.push(sanitizeFailure("calendar", calendarResult.reason));
+        if (requested.has("calendar")) {
+            if (calendarResult.status === "fulfilled") {
+                availableSources.push("calendar");
+            } else {
+                errors.push(sanitizeFailure("calendar", calendarResult.reason));
+            }
         }
 
         const tasksResult = settled[1];
         const tasks = tasksResult.status === "fulfilled"
             ? classifyTasks(tasksResult.value, day)
             : { overdue: [], dueToday: [] };
-        if (tasksResult.status === "fulfilled") {
-            availableSources.push("tasks");
-        } else {
-            errors.push(sanitizeFailure("tasks", tasksResult.reason));
+        if (requested.has("tasks")) {
+            if (tasksResult.status === "fulfilled") {
+                availableSources.push("tasks");
+            } else {
+                errors.push(sanitizeFailure("tasks", tasksResult.reason));
+            }
         }
 
         const mailResult = settled[2];
         const mail = mailResult.status === "fulfilled"
             ? classifyMail(mailResult.value)
             : { attention: [], unread: [], important: [] };
-        if (mailResult.status === "fulfilled") {
-            availableSources.push("mail");
-        } else {
-            errors.push(sanitizeFailure("mail", mailResult.reason));
+        if (requested.has("mail")) {
+            if (mailResult.status === "fulfilled") {
+                availableSources.push("mail");
+            } else {
+                errors.push(sanitizeFailure("mail", mailResult.reason));
+            }
         }
 
         let counts = buildCounts(eventsToday, tasks, mail, errors);
@@ -217,7 +240,7 @@ export class DailyBriefingService {
                     await publisher.publish({
                         type: "daily-briefing",
                         title: "Resumo diário",
-                        message: formatCountMessage(counts),
+                        message: formatCountMessage(counts, requestedSources),
                         trust: "untrusted-derived",
                         generatedAt: generatedAtDate.toISOString(),
                         counts,
@@ -314,6 +337,7 @@ export interface DailyBriefingToolInput {
     readonly at?: string;
     readonly timeZone?: string;
     readonly maxEmails?: number;
+    readonly sources?: DailyBriefingSource[];
     readonly publishNotification?: boolean;
 }
 
@@ -338,6 +362,11 @@ export function createDailyBriefingTool(
                 },
                 timeZone: { type: "string", description: "Timezone IANA." },
                 maxEmails: { type: "integer", minimum: 1, maximum: 100 },
+                sources: {
+                    type: "array",
+                    minItems: 1,
+                    items: { type: "string", enum: ["calendar", "tasks", "mail"] },
+                },
                 publishNotification: { type: "boolean" },
             },
             additionalProperties: false,
@@ -357,14 +386,16 @@ export function createDailyBriefingTool(
             let at: Date | undefined;
             try {
                 at = input.at === undefined ? undefined : parseAbsoluteInstant(input.at);
+                const requestedSources = normalizeDailyBriefingSources(input.sources);
                 const briefing = await service.generate({
                     at,
                     timeZone: input.timeZone,
                     maxEmails: input.maxEmails,
+                    sources: requestedSources,
                     publishNotification: input.publishNotification,
                     signal: context.signal,
                 });
-                const message = formatCountMessage(briefing.counts);
+                const message = formatCountMessage(briefing.counts, requestedSources);
                 const hasAvailableSource = briefing.availableSources.length > 0;
                 // Para uma execução agendada, publicar é a entrega. Marcar a
                 // action como concluída quando o publisher falha impediria o
@@ -492,18 +523,34 @@ function buildCounts(
 }
 
 /** Mensagem deliberadamente limitada a contagens, sem texto externo. */
-export function formatDailyBriefingCountMessage(counts: DailyBriefingCounts): string {
-    return formatCountMessage(counts);
+export function formatDailyBriefingCountMessage(
+    counts: DailyBriefingCounts,
+    sources?: readonly DailyBriefingSource[],
+): string {
+    return formatCountMessage(counts, normalizeDailyBriefingSources(sources));
 }
 
-function formatCountMessage(counts: DailyBriefingCounts): string {
-    const parts = [
-        `${counts.eventsToday} evento(s) hoje`,
-        `${counts.overdueTasks} tarefa(s) vencida(s)`,
-        `${counts.tasksDueToday} tarefa(s) para hoje`,
-        `${counts.unreadEmails} email(s) não lido(s)`,
-        `${counts.importantEmails} email(s) importante(s)`,
-    ];
+function formatCountMessage(
+    counts: DailyBriefingCounts,
+    sources: readonly DailyBriefingSource[],
+): string {
+    const selected = new Set(sources);
+    const parts: string[] = [];
+    if (selected.has("calendar")) {
+        parts.push(`${counts.eventsToday} evento(s) hoje`);
+    }
+    if (selected.has("tasks")) {
+        parts.push(
+            `${counts.overdueTasks} tarefa(s) vencida(s)`,
+            `${counts.tasksDueToday} tarefa(s) para hoje`,
+        );
+    }
+    if (selected.has("mail")) {
+        parts.push(
+            `${counts.unreadEmails} email(s) não lido(s)`,
+            `${counts.importantEmails} email(s) importante(s)`,
+        );
+    }
     if (counts.unavailableSources > 0) {
         parts.push(`${counts.unavailableSources} fonte(s) indisponível(is)`);
     }
@@ -604,6 +651,23 @@ function checkedTimeZone(value: string): string {
         throw new RangeError("Timezone inválido.");
     }
     return normalized;
+}
+
+export function normalizeDailyBriefingSources(
+    sources: readonly DailyBriefingSource[] | undefined,
+): DailyBriefingSource[] {
+    if (sources === undefined) return [...ALL_DAILY_BRIEFING_SOURCES];
+    if (!Array.isArray(sources) || sources.length === 0) {
+        throw new RangeError("Selecione ao menos uma fonte para o resumo.");
+    }
+    const selected = new Set<DailyBriefingSource>();
+    for (const source of sources) {
+        if (!ALL_DAILY_BRIEFING_SOURCES.includes(source)) {
+            throw new TypeError(`Fonte de resumo inválida: ${String(source)}.`);
+        }
+        selected.add(source);
+    }
+    return ALL_DAILY_BRIEFING_SOURCES.filter(source => selected.has(source));
 }
 
 function clampMaxEmails(value: number | undefined, fallback: number): number {

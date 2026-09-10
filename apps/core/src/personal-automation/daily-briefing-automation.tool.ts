@@ -2,6 +2,10 @@ import type { AutomationEngine } from "../automation-engine/automation-engine.ts
 import type { Automation } from "../automation-engine/types.ts";
 import type { ToolDefinition } from "../tools/tool.ts";
 import { KeyedExecutionQueue } from "./monitors/keyed-execution.ts";
+import {
+    normalizeDailyBriefingSources,
+    type DailyBriefingSource,
+} from "./daily-briefing.ts";
 
 const creationQueues = new WeakMap<AutomationEngine, KeyedExecutionQueue>();
 const ALL_DAYS = [0, 1, 2, 3, 4, 5, 6] as const;
@@ -12,6 +16,7 @@ export interface CreateDailyBriefingAutomationInput {
     timeZone?: string;
     daysOfWeek?: number[];
     maxEmails?: number;
+    sources?: DailyBriefingSource[];
 }
 
 export interface DailyBriefingAutomationResult {
@@ -49,6 +54,11 @@ export function createDailyBriefingAutomationTool(
                     items: { type: "integer", minimum: 0, maximum: 6 },
                 },
                 maxEmails: { type: "integer", minimum: 1, maximum: 100 },
+                sources: {
+                    type: "array",
+                    minItems: 1,
+                    items: { type: "string", enum: ["calendar", "tasks", "mail"] },
+                },
             },
             required: ["time"],
             additionalProperties: false,
@@ -84,15 +94,21 @@ export function createDailyBriefingAutomationTool(
                         || defaultTimeZone.trim()
                         || "America/Sao_Paulo";
                     const daysOfWeek = normalizeDaysOfWeek(input.daysOfWeek);
+                    const sources = normalizeDailyBriefingSources(input.sources);
+                    const maxEmails = sources.includes("mail")
+                        ? input.maxEmails
+                        : undefined;
                     const fingerprint = dailyBriefingFingerprint({
                         ...input,
                         timeZone,
                         daysOfWeek,
+                        maxEmails,
+                        sources,
                     });
                     const existing = (await engine.listAutomations()).find(
                         automation => isEquivalentDailyBriefing(
                             automation,
-                            { ...input, timeZone, daysOfWeek },
+                            { ...input, timeZone, daysOfWeek, maxEmails, sources },
                             fingerprint,
                         ),
                     );
@@ -125,9 +141,10 @@ export function createDailyBriefingAutomationTool(
                             input: {
                                 timeZone,
                                 publishNotification: true,
-                                ...(input.maxEmails === undefined
+                                sources,
+                                ...(maxEmails === undefined
                                     ? {}
-                                    : { maxEmails: input.maxEmails }),
+                                    : { maxEmails }),
                             },
                         }],
                         timezone: timeZone,
@@ -171,11 +188,15 @@ function normalizeDaysOfWeek(days: readonly number[] | undefined): number[] | un
 }
 
 function dailyBriefingFingerprint(input: CreateDailyBriefingAutomationInput): string {
+    const sources = normalizeDailyBriefingSources(input.sources);
     return JSON.stringify({
         time: input.time,
         timeZone: input.timeZone,
         daysOfWeek: input.daysOfWeek ?? ALL_DAYS,
-        maxEmails: input.maxEmails ?? DEFAULT_MAX_EMAILS,
+        maxEmails: sources.includes("mail")
+            ? input.maxEmails ?? DEFAULT_MAX_EMAILS
+            : null,
+        sources,
     });
 }
 
@@ -207,18 +228,41 @@ function isEquivalentDailyBriefing(
         && !Array.isArray(actionInput)
         ? actionInput.maxEmails
         : undefined;
+    const storedSources = storedBriefingSources(actionInput);
+    if (!storedSources) return false;
     return schedule.kind === "daily"
         && schedule.time === input.time
         && automation.timezone === input.timeZone
         && sameNumbers(storedDays ?? ALL_DAYS, input.daysOfWeek ?? ALL_DAYS)
-        && (storedMaxEmails ?? DEFAULT_MAX_EMAILS)
-            === (input.maxEmails ?? DEFAULT_MAX_EMAILS);
+        && (!storedSources.includes("mail")
+            || (storedMaxEmails ?? DEFAULT_MAX_EMAILS)
+                === (input.maxEmails ?? DEFAULT_MAX_EMAILS))
+        && sameStrings(storedSources, normalizeDailyBriefingSources(input.sources));
 }
 
 function sameNumbers(
     left: readonly number[],
     right: readonly number[],
 ): boolean {
+    return left.length === right.length
+        && left.every((value, index) => value === right[index]);
+}
+
+function storedBriefingSources(
+    input: unknown,
+): DailyBriefingSource[] | null {
+    if (!input || typeof input !== "object" || Array.isArray(input)) return null;
+    const sources = (input as Record<string, unknown>).sources;
+    if (sources === undefined) return normalizeDailyBriefingSources(undefined);
+    if (!Array.isArray(sources)) return null;
+    try {
+        return normalizeDailyBriefingSources(sources as DailyBriefingSource[]);
+    } catch {
+        return null;
+    }
+}
+
+function sameStrings(left: readonly string[], right: readonly string[]): boolean {
     return left.length === right.length
         && left.every((value, index) => value === right[index]);
 }
